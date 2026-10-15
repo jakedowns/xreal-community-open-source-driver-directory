@@ -1,4 +1,4 @@
-# xreal-community-open-source-driver-directory
+# xreal community open source driver directory
 
 ⭐ Please star this repo if you find this work helpful! 🤩
 
