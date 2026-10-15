@@ -1,10 +1,6 @@
-# xreal-webxr
+# xreal-community-open-source-driver-directory
 
 ⭐ Please star this repo if you find this work helpful! 🤩
-
-work in progress; webxr support for xreal devices
-
-> WebXR Bindings and Test Utilities / Getting-Started Example(s) Basis for NPM package
 
 🙌 🥽 💪 based on combined effort of the Xreal Open Source Community:
 
@@ -21,7 +17,7 @@ work in progress; webxr support for xreal devices
 
 ### Xreal Open Source Community Drivers:
 
-- [WebXR](https://github.com/jakedowns/xreal-webxr)
+- [WebXR](https://github.com/jakedowns/xreal-community-open-source-driver-directory)
 - [Windows](https://github.com/MSmithDev/AirAPI_Windows)
 - [Android](https://github.com/SARankDirector-Minecraft/XR-android-driver)
 - [Linux](https://gitlab.com/TheJackiMonster/nrealAirLinuxDriver)
@@ -47,11 +43,6 @@ work in progress; webxr support for xreal devices
 - [Wayne Heaney, wheaney](https://github.com/wheaney)
 - [Alex Badics, badicsalex](https://github.com/badicsalex)
 - [SARankDirector-Minecraft](https://github.com/SARankDirector-Minecraft)
-
-### Roadmap
-
-- 🌐 🥽 [OpenXR](#coming-soon) # coming soon
-- ☁️ 🥽 [CloudXR](#on-hold) # on hold
 
 ### Read the history of this project:
 
