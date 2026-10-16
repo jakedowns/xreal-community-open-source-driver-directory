@@ -1,0 +1,823 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Xreal Air · IMU Monitor</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg:      #0b0d12;
+    --surface: #12151d;
+    --border:  #1e2433;
+    --dim:     #2a3045;
+    --muted:   #4a5572;
+    --text:    #c8d0e8;
+    --bright:  #e8edf8;
+    --x:       #5b8af0;   /* X axis — cool blue */
+    --y:       #3ecf8e;   /* Y axis — green */
+    --z:       #e8855a;   /* Z axis — warm amber */
+    --accent:  #5b8af0;
+    --mono: 'JetBrains Mono', 'Fira Mono', 'Consolas', monospace;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--mono);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    padding: 0 0 40px 0;
+  }
+
+  /* ── header ── */
+  header {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 22px 28px;
+    border-bottom: 1px solid var(--border);
+  }
+  .logo-ring {
+    width: 36px; height: 36px;
+    border-radius: 50%;
+    border: 2px solid var(--accent);
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0;
+  }
+  .logo-dot {
+    width: 10px; height: 10px;
+    border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 8px var(--accent);
+  }
+  .title-block { flex: 1; }
+  .title-block h1 {
+    font-size: 14px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--bright);
+    font-weight: 600;
+  }
+  .title-block p {
+    font-size: 11px;
+    color: var(--muted);
+    margin-top: 2px;
+    letter-spacing: 0.04em;
+  }
+  #status-pill {
+    font-size: 10px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    padding: 4px 10px;
+    border-radius: 20px;
+    background: var(--dim);
+    color: var(--muted);
+    border: 1px solid var(--border);
+    transition: all 0.3s;
+  }
+  #status-pill.connected {
+    background: rgba(62,207,142,0.12);
+    color: var(--y);
+    border-color: rgba(62,207,142,0.3);
+  }
+  #status-pill.streaming {
+    background: rgba(91,138,240,0.12);
+    color: var(--x);
+    border-color: rgba(91,138,240,0.35);
+    animation: pulse-border 2s infinite;
+  }
+  #status-pill.error {
+    background: rgba(232,133,90,0.12);
+    color: var(--z);
+    border-color: rgba(232,133,90,0.35);
+  }
+  @keyframes pulse-border {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(91,138,240,0.25); }
+    50% { box-shadow: 0 0 0 4px rgba(91,138,240,0.0); }
+  }
+
+  /* ── controls ── */
+  .controls {
+    display: flex;
+    gap: 10px;
+    padding: 18px 28px;
+    border-bottom: 1px solid var(--border);
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  button {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    padding: 8px 18px;
+    border-radius: 5px;
+    border: 1px solid var(--dim);
+    cursor: pointer;
+    transition: all 0.15s;
+    background: var(--surface);
+    color: var(--text);
+  }
+  button:hover:not(:disabled) {
+    border-color: var(--accent);
+    color: var(--bright);
+  }
+  button:disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
+  }
+  #btn-connect {
+    border-color: rgba(91,138,240,0.4);
+    color: var(--x);
+  }
+  #btn-connect:hover:not(:disabled) {
+    background: rgba(91,138,240,0.1);
+    border-color: var(--x);
+  }
+  #btn-toggle {
+    border-color: rgba(62,207,142,0.35);
+    color: var(--y);
+  }
+  #btn-toggle:hover:not(:disabled) {
+    background: rgba(62,207,142,0.1);
+    border-color: var(--y);
+  }
+  #btn-toggle.stop {
+    border-color: rgba(232,133,90,0.35);
+    color: var(--z);
+  }
+  #btn-toggle.stop:hover:not(:disabled) {
+    background: rgba(232,133,90,0.1);
+    border-color: var(--z);
+  }
+  #btn-clear {
+    color: var(--muted);
+  }
+  .controls-right {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+  }
+  .selector-label {
+    font-size: 10px;
+    color: var(--muted);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    white-space: nowrap;
+  }
+  select {
+    font-family: var(--mono);
+    font-size: 11px;
+    background: var(--surface);
+    color: var(--text);
+    border: 1px solid var(--dim);
+    border-radius: 4px;
+    padding: 6px 10px;
+    cursor: pointer;
+  }
+  select:focus { outline: none; border-color: var(--accent); }
+
+  /* ── telemetry strip ── */
+  .telem-strip {
+    display: flex;
+    gap: 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .telem-card {
+    flex: 1;
+    padding: 14px 20px;
+    border-right: 1px solid var(--border);
+    position: relative;
+  }
+  .telem-card:last-child { border-right: none; }
+  .telem-label {
+    font-size: 10px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    margin-bottom: 6px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .axis-dot {
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    display: inline-block;
+    flex-shrink: 0;
+  }
+  .telem-value {
+    font-size: 22px;
+    font-weight: 600;
+    color: var(--bright);
+    line-height: 1;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.02em;
+  }
+  .telem-unit {
+    font-size: 10px;
+    color: var(--muted);
+    margin-top: 3px;
+    letter-spacing: 0.05em;
+  }
+  .telem-bar {
+    position: absolute;
+    bottom: 0; left: 0;
+    height: 2px;
+    transition: width 0.1s;
+  }
+
+  /* ── mode tabs ── */
+  .mode-tabs {
+    display: flex;
+    gap: 0;
+    padding: 0 28px;
+    border-bottom: 1px solid var(--border);
+  }
+  .tab {
+    padding: 12px 16px;
+    font-size: 11px;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+    color: var(--muted);
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -1px;
+    user-select: none;
+    transition: all 0.15s;
+  }
+  .tab.active {
+    color: var(--bright);
+    border-bottom-color: var(--accent);
+  }
+  .tab:hover:not(.active) { color: var(--text); }
+
+  /* ── chart area ── */
+  .chart-section {
+    padding: 24px 28px;
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+  }
+  .chart-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 4px;
+  }
+  .chart-title {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: var(--muted);
+  }
+  .legend {
+    display: flex;
+    gap: 18px;
+  }
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 10px;
+    color: var(--muted);
+    letter-spacing: 0.06em;
+  }
+  .legend-line {
+    width: 16px; height: 2px;
+    border-radius: 1px;
+    display: inline-block;
+  }
+
+  .chart-wrap {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 16px;
+    position: relative;
+  }
+  .chart-wrap canvas {
+    display: block;
+    width: 100% !important;
+  }
+
+  /* ── log panel ── */
+  #log-panel {
+    margin: 0 28px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 11px;
+    color: var(--muted);
+    padding: 12px 16px;
+    height: 120px;
+    overflow-y: auto;
+    display: none;
+  }
+  #log-panel .log-line { margin: 2px 0; }
+  #log-panel .log-line.info { color: var(--text); }
+  #log-panel .log-line.ok   { color: var(--y); }
+  #log-panel .log-line.warn { color: var(--z); }
+  #log-panel .log-line.err  { color: #e85a5a; }
+
+  /* ── packet rate ── */
+  #pkt-rate {
+    font-size: 10px;
+    color: var(--muted);
+    letter-spacing: 0.07em;
+  }
+
+  /* ── no WebUSB warning ── */
+  #no-usb-warn {
+    display: none;
+    margin: 24px 28px;
+    padding: 14px 18px;
+    background: rgba(232,133,90,0.08);
+    border: 1px solid rgba(232,133,90,0.25);
+    border-radius: 6px;
+    font-size: 12px;
+    color: var(--z);
+    line-height: 1.6;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo-ring"><div class="logo-dot"></div></div>
+  <div class="title-block">
+    <h1>Xreal Air · IMU Monitor</h1>
+    <p>VID 0x3318 · PID 0x0423 · WebUSB HID Interface 3</p>
+  </div>
+  <div id="status-pill">Disconnected</div>
+</header>
+
+<div id="no-usb-warn">
+  ⚠ WebHID is not available. Open this page in Chrome (or a Chromium-based browser) and make sure
+  you're on a secure origin (HTTPS or localhost). Firefox and Safari do not support WebHID.
+</div>
+
+<div class="controls">
+  <button id="btn-connect">⊕ Connect Glasses</button>
+  <button id="btn-toggle" disabled>▶ Start Tracking</button>
+  <button id="btn-clear" disabled>✕ Clear</button>
+  <div class="controls-right">
+    <span class="selector-label">Mode</span>
+    <select id="mode-select">
+      <option value="gyro">Gyroscope (°/s)</option>
+      <option value="accel">Accelerometer (g)</option>
+    </select>
+    <span class="selector-label">Window</span>
+    <select id="window-select">
+      <option value="200">200 pts</option>
+      <option value="500" selected>500 pts</option>
+      <option value="1000">1000 pts</option>
+    </select>
+    <span id="pkt-rate">— pkt/s</span>
+  </div>
+</div>
+
+<div class="telem-strip">
+  <div class="telem-card">
+    <div class="telem-label">
+      <span class="axis-dot" style="background:var(--x)"></span>
+      <span style="color:var(--x)">X axis</span>
+    </div>
+    <div class="telem-value" id="val-x">—</div>
+    <div class="telem-unit" id="unit-x">°/s</div>
+    <div class="telem-bar" style="background:var(--x)" id="bar-x"></div>
+  </div>
+  <div class="telem-card">
+    <div class="telem-label">
+      <span class="axis-dot" style="background:var(--y)"></span>
+      <span style="color:var(--y)">Y axis</span>
+    </div>
+    <div class="telem-value" id="val-y">—</div>
+    <div class="telem-unit" id="unit-y">°/s</div>
+    <div class="telem-bar" style="background:var(--y)" id="bar-y"></div>
+  </div>
+  <div class="telem-card">
+    <div class="telem-label">
+      <span class="axis-dot" style="background:var(--z)"></span>
+      <span style="color:var(--z)">Z axis</span>
+    </div>
+    <div class="telem-value" id="val-z">—</div>
+    <div class="telem-unit" id="unit-z">°/s</div>
+    <div class="telem-bar" style="background:var(--z)" id="bar-z"></div>
+  </div>
+  <div class="telem-card" style="flex:0.5; min-width:120px;">
+    <div class="telem-label"><span style="color:var(--muted)">Packets/s</span></div>
+    <div class="telem-value" id="val-pps">—</div>
+    <div class="telem-unit">sample rate</div>
+  </div>
+</div>
+
+<div class="chart-section">
+  <div>
+    <div class="chart-header">
+      <span class="chart-title" id="chart-title-label">Gyroscope · rolling window</span>
+      <div class="legend">
+        <div class="legend-item"><span class="legend-line" style="background:var(--x)"></span> X</div>
+        <div class="legend-item"><span class="legend-line" style="background:var(--y)"></span> Y</div>
+        <div class="legend-item"><span class="legend-line" style="background:var(--z)"></span> Z</div>
+      </div>
+    </div>
+    <div class="chart-wrap">
+      <canvas id="main-chart" height="200"></canvas>
+    </div>
+  </div>
+</div>
+
+<div id="log-panel"></div>
+
+<script>
+// ══════════════════════════════════════════════════════════════
+//  Constants matching the Linux/Windows driver
+// ══════════════════════════════════════════════════════════════
+const AIR_VID = 0x3318;
+const AIR_PID = 0x0423;          // original Air
+let imuInterface = 3;         // HID interface 3 carries IMU data (will fallback dynamically if needed)
+const GYRO_SCALAR  = 1.0 / 8388608.0 * 2000.0;   // 24-bit signed, ±2000 °/s
+const ACCEL_SCALAR = 1.0 / 8388608.0 * 16.0;      // 24-bit signed, ±16 g
+
+// Magic payload that enables IMU streaming (reverse-engineered)
+// Source: MSmithDev/AirAPI_Windows & TheJackiMonster/nrealAirLinuxDriver
+const MAGIC_PAYLOAD = new Uint8Array([
+  0x00,               // report ID
+  0xaa, 0xc5, 0xd1, 0x21, 0x42, 0x04, 0x00, 0x19, 0x01
+]);
+
+// ══════════════════════════════════════════════════════════════
+//  State
+// ══════════════════════════════════════════════════════════════
+let hidDevices  = [];
+let streaming   = false;
+
+let windowSize  = 500;
+let mode        = 'gyro';   // 'gyro' | 'accel'
+
+const bufX = [], bufY = [], bufZ = [];
+let pktCount = 0, ppsLast = 0;
+
+// ══════════════════════════════════════════════════════════════
+//  Packet parser  (mirrors parse_report() in the C driver)
+//
+//  64-byte HID report layout:
+//   [0..3]   header / padding
+//   [4..11]  uint64 timestamp (nanoseconds, little-endian)
+//   [12..17] 6 padding bytes before gyro
+//   [18..26] gyro x,y,z — each 3 bytes little-endian signed 24-bit
+//   [27..32] 6 padding bytes before accel
+//   [33..41] accel x,y,z — each 3 bytes little-endian signed 24-bit
+// ══════════════════════════════════════════════════════════════
+function read24Signed(buf, offset) {
+  const b0 = buf[offset];
+  const b1 = buf[offset + 1];
+  const b2 = buf[offset + 2];
+  let v = b0 | (b1 << 8) | (b2 << 16);
+  if (b2 & 0x80) v |= (0xFF << 24);   // sign extend
+  return v;
+}
+
+function parseReport(data) {
+  if (data.byteLength < 64) return null;
+  const buf = new Uint8Array(data.buffer || data);
+
+  // timestamp (bytes 4–11, uint64 LE — we read 53-bit safe portion)
+  let tick = 0;
+  for (let i = 0; i < 8; i++) tick += buf[4 + i] * Math.pow(256, i);
+
+  // gyro at offset 18 (skip 4 header + 8 timestamp + 6 padding)
+  const gx = read24Signed(buf, 18);
+  const gy = read24Signed(buf, 21);
+  const gz = read24Signed(buf, 24);
+
+  // accel at offset 33 (gyro ends at 27, +6 padding = 33)
+  const ax = read24Signed(buf, 33);
+  const ay = read24Signed(buf, 36);
+  const az = read24Signed(buf, 39);
+
+  return {
+    tick,
+    gyro:  [gx * GYRO_SCALAR,  gy * GYRO_SCALAR,  gz * GYRO_SCALAR],
+    accel: [ax * ACCEL_SCALAR, ay * ACCEL_SCALAR, az * ACCEL_SCALAR],
+  };
+}
+
+// ══════════════════════════════════════════════════════════════
+//  Chart
+// ══════════════════════════════════════════════════════════════
+const ctx = document.getElementById('main-chart').getContext('2d');
+const chart = new Chart(ctx, {
+  type: 'line',
+  data: {
+    labels: [],
+    datasets: [
+      {
+        label: 'X', data: [],
+        borderColor: '#5b8af0',
+        backgroundColor: 'rgba(91,138,240,0.06)',
+        borderWidth: 1.5, pointRadius: 0, tension: 0.2, fill: false,
+      },
+      {
+        label: 'Y', data: [],
+        borderColor: '#3ecf8e',
+        backgroundColor: 'rgba(62,207,142,0.06)',
+        borderWidth: 1.5, pointRadius: 0, tension: 0.2, fill: false,
+      },
+      {
+        label: 'Z', data: [],
+        borderColor: '#e8855a',
+        backgroundColor: 'rgba(232,133,90,0.06)',
+        borderWidth: 1.5, pointRadius: 0, tension: 0.2, fill: false,
+      },
+    ],
+  },
+  options: {
+    animation: false,
+    responsive: true,
+    interaction: { mode: 'index', intersect: false },
+    plugins: {
+      legend: { display: false },
+      tooltip: {
+        backgroundColor: '#12151d',
+        borderColor: '#1e2433',
+        borderWidth: 1,
+        titleColor: '#c8d0e8',
+        bodyColor: '#c8d0e8',
+        callbacks: {
+          label: (ctx) => ` ${ctx.dataset.label}: ${ctx.parsed.y.toFixed(4)}`,
+        },
+      },
+    },
+    scales: {
+      x: {
+        display: false,
+        ticks: { color: '#4a5572' },
+        grid:  { color: '#1e2433' },
+      },
+      y: {
+        ticks: {
+          color: '#4a5572',
+          font: { family: "'JetBrains Mono', monospace", size: 10 },
+          callback: v => v.toFixed(2),
+        },
+        grid: { color: '#1e2433', borderDash: [2, 4] },
+        border: { color: '#1e2433' },
+      },
+    },
+  },
+});
+
+function pushSample(x, y, z) {
+  const d = chart.data;
+  d.labels.push('');
+  d.datasets[0].data.push(x);
+  d.datasets[1].data.push(y);
+  d.datasets[2].data.push(z);
+  if (d.labels.length > windowSize) {
+    d.labels.shift();
+    d.datasets.forEach(ds => ds.data.shift());
+  }
+  chart.update('none');
+
+  // telemetry values
+  document.getElementById('val-x').textContent = x.toFixed(3);
+  document.getElementById('val-y').textContent = y.toFixed(3);
+  document.getElementById('val-z').textContent = z.toFixed(3);
+
+  // bar indicators (map to 0–100% over ±range)
+  const range = mode === 'gyro' ? 2000 : 16;
+  const pct = v => Math.min(100, Math.round(Math.abs(v) / range * 100));
+  document.getElementById('bar-x').style.width = pct(x) + '%';
+  document.getElementById('bar-y').style.width = pct(y) + '%';
+  document.getElementById('bar-z').style.width = pct(z) + '%';
+}
+
+// ══════════════════════════════════════════════════════════════
+//  Packet-rate counter
+// ══════════════════════════════════════════════════════════════
+setInterval(() => {
+  const pps = pktCount - ppsLast;
+  ppsLast = pktCount;
+  document.getElementById('val-pps').textContent = pps;
+  document.getElementById('pkt-rate').textContent = `${pps} pkt/s`;
+}, 1000);
+
+// ══════════════════════════════════════════════════════════════
+//  Log
+// ══════════════════════════════════════════════════════════════
+const logPanel = document.getElementById('log-panel');
+function log(msg, cls = 'info') {
+  logPanel.style.display = 'block';
+  const el = document.createElement('div');
+  el.className = 'log-line ' + cls;
+  el.textContent = '[' + new Date().toLocaleTimeString() + '] ' + msg;
+  logPanel.appendChild(el);
+  logPanel.scrollTop = logPanel.scrollHeight;
+}
+
+// ══════════════════════════════════════════════════════════════
+//  WebHID helpers
+// ══════════════════════════════════════════════════════════════
+function setStatus(text, cls = '') {
+  const el = document.getElementById('status-pill');
+  el.textContent = text;
+  el.className = cls;
+}
+
+function handleInputReport(event) {
+  if (!streaming) return;
+  const { data, reportId, device } = event;
+  
+  let buf;
+  if (data.byteLength === 64) {
+    buf = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  } else if (data.byteLength === 63) {
+    // Missing report ID 0, prepend it
+    buf = new Uint8Array(64);
+    buf[0] = reportId;
+    buf.set(new Uint8Array(data.buffer, data.byteOffset, data.byteLength), 1);
+  } else {
+    buf = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  }
+
+  const parsed = parseReport(buf);
+  if (parsed) {
+    pktCount++;
+    const [x, y, z] = mode === 'gyro' ? parsed.gyro : parsed.accel;
+    pushSample(x, y, z);
+  } else {
+    // Log unrecognized packets a few times to debug
+    if (window._unrecognizedLogged === undefined) window._unrecognizedLogged = 0;
+    if (window._unrecognizedLogged < 5) {
+      log(`Unrecognized report from ${device.productName} (ID: ${reportId}, len: ${data.byteLength})`, 'warn');
+      window._unrecognizedLogged++;
+    }
+  }
+}
+
+async function connectDevice() {
+  try {
+    const devices = await navigator.hid.requestDevice({
+      filters: [], // Do not limit by VID/PID so we can see all interfaces the OS exposes
+    });
+    if (devices.length === 0) return;
+    
+    hidDevices = devices;
+    log(`Selected ${hidDevices.length} HID interface(s)`, 'info');
+    
+    for (let i = 0; i < hidDevices.length; i++) {
+      const d = hidDevices[i];
+      log(`Interface [${i}]: ${d.productName}`);
+      d.collections.forEach((c, cIdx) => {
+        log(`  Collection [${cIdx}]: usagePage=0x${c.usagePage.toString(16)}, usage=0x${c.usage.toString(16)}`);
+        if (c.inputReports && c.inputReports.length > 0) log(`    Input: ${c.inputReports.map(r => r.reportId).join(', ')}`);
+        if (c.outputReports && c.outputReports.length > 0) log(`    Output: ${c.outputReports.map(r => r.reportId).join(', ')}`);
+        if (c.featureReports && c.featureReports.length > 0) log(`    Feature: ${c.featureReports.map(r => r.reportId).join(', ')}`);
+      });
+
+      if (!d.opened) {
+        await d.open();
+        log(`Opened interface [${i}]`, 'ok');
+      }
+      d.addEventListener('inputreport', handleInputReport);
+    }
+
+    setStatus('Connected', 'connected');
+    document.getElementById('btn-toggle').disabled = false;
+    document.getElementById('btn-clear').disabled = false;
+    document.getElementById('btn-connect').disabled = true;
+
+  } catch (err) {
+    log(`Connection failed: ${err.message}`, 'err');
+    setStatus('Error', 'error');
+    hidDevices = [];
+  }
+}
+
+async function sendMagicPacket() {
+  for (let i = 0; i < hidDevices.length; i++) {
+    const d = hidDevices[i];
+    try {
+      await d.sendReport(MAGIC_PAYLOAD[0], MAGIC_PAYLOAD.slice(1));
+      log(`[Intf ${i}] Magic packet sent via output report`, 'ok');
+    } catch (err) {
+      log(`[Intf ${i}] sendReport failed (${err.message}), trying sendFeatureReport…`, 'warn');
+      try {
+        await d.sendFeatureReport(MAGIC_PAYLOAD[0], MAGIC_PAYLOAD.slice(1));
+        log(`[Intf ${i}] Magic packet sent via feature report`, 'ok');
+      } catch (err2) {
+        log(`[Intf ${i}] Feature report also failed: ${err2.message}`, 'err');
+      }
+    }
+  }
+}
+
+async function startTracking() {
+  if (hidDevices.length === 0) return;
+  streaming = true;
+
+  log('Sending IMU enable packet to all interfaces…');
+  await sendMagicPacket();
+
+  setStatus('Streaming', 'streaming');
+  log('Reading IMU data via input reports…', 'ok');
+}
+
+async function stopTracking() {
+  streaming = false;
+  setStatus('Connected', 'connected');
+  log('Tracking stopped', 'warn');
+}
+
+// ══════════════════════════════════════════════════════════════
+//  UI wiring
+// ══════════════════════════════════════════════════════════════
+document.getElementById('btn-connect').addEventListener('click', connectDevice);
+
+document.getElementById('btn-toggle').addEventListener('click', async () => {
+  const btn = document.getElementById('btn-toggle');
+  if (!streaming) {
+    btn.textContent = '■ Stop Tracking';
+    btn.classList.add('stop');
+    await startTracking();
+  } else {
+    btn.textContent = '▶ Start Tracking';
+    btn.classList.remove('stop');
+    await stopTracking();
+  }
+});
+
+document.getElementById('btn-clear').addEventListener('click', () => {
+  chart.data.labels = [];
+  chart.data.datasets.forEach(ds => ds.data = []);
+  chart.update('none');
+  ['x','y','z'].forEach(a => {
+    document.getElementById('val-' + a).textContent = '—';
+    document.getElementById('bar-' + a).style.width = '0%';
+  });
+  document.getElementById('val-pps').textContent = '—';
+});
+
+document.getElementById('mode-select').addEventListener('change', e => {
+  mode = e.target.value;
+  const unit = mode === 'gyro' ? '°/s' : 'g';
+  document.getElementById('unit-x').textContent = unit;
+  document.getElementById('unit-y').textContent = unit;
+  document.getElementById('unit-z').textContent = unit;
+  document.getElementById('chart-title-label').textContent =
+    (mode === 'gyro' ? 'Gyroscope' : 'Accelerometer') + ' · rolling window';
+  // clear chart on mode switch
+  chart.data.labels = [];
+  chart.data.datasets.forEach(ds => ds.data = []);
+  chart.update('none');
+});
+
+document.getElementById('window-select').addEventListener('change', e => {
+  windowSize = parseInt(e.target.value);
+  // trim existing data
+  while (chart.data.labels.length > windowSize) {
+    chart.data.labels.shift();
+    chart.data.datasets.forEach(ds => ds.data.shift());
+  }
+  chart.update('none');
+});
+
+// ══════════════════════════════════════════════════════════════
+//  WebHID availability check
+// ══════════════════════════════════════════════════════════════
+if (!navigator.hid) {
+  document.getElementById('no-usb-warn').style.display = 'block';
+  document.getElementById('btn-connect').disabled = true;
+  setStatus('No WebHID', 'error');
+}
+
+// Re-attach on reconnect
+navigator.hid && navigator.hid.addEventListener('connect', e => {
+  if (e.device.vendorId === AIR_VID) log('Xreal Air reconnected', 'ok');
+});
+navigator.hid && navigator.hid.addEventListener('disconnect', e => {
+  const idx = hidDevices.indexOf(e.device);
+  if (idx !== -1) {
+    hidDevices.splice(idx, 1);
+    log(`Interface disconnected`, 'warn');
+    if (hidDevices.length === 0) {
+      streaming = false;
+      setStatus('Disconnected', '');
+      document.getElementById('btn-toggle').disabled = true;
+      document.getElementById('btn-toggle').textContent = '▶ Start Tracking';
+      document.getElementById('btn-toggle').classList.remove('stop');
+      document.getElementById('btn-connect').disabled = false;
+      log('All interfaces disconnected', 'err');
+    }
+  }
+});
+</script>
+</body>
+</html>
