@@ -1,0 +1,2133 @@
+<!DOCTYPE html>
+<!--
+╔══════════════════════════════════════════════════════════════╗
+║  USB Monitor — WebUSB Packet Inspector for XREAL Air       ║
+╠══════════════════════════════════════════════════════════════╣
+║  Single HTML file that connects to XREAL Air glasses via   ║
+║  WebUSB (and WebHID fallback) to capture, decode, and      ║
+║  visualize USB interrupt packets in real time.             ║
+╚══════════════════════════════════════════════════════════════╝
+
+── Architecture ───────────────────────────────────────────────
+  • WebUSB  – primary transport; claims interfaces and polls
+              endpoints (EP 0x84 for IMU data).
+  • WebHID  – fallback for sending IMU enable commands, since
+              Chrome blocks claimInterface on HID class (0x03)
+              via WebUSB ("protected class").
+  • Three.js – 3D head visualization driven by gyro-integrated
+               Euler angles (pitch/yaw/roll), positioned right
+               of the gyro sparkline.
+
+── Features ──────────────────────────────────────────────────
+  • USB packet capture (interrupt transfers) with live list,
+    autoscroll, per-packet click-to-inspect details.
+  • IMU data column & detail panel: parses gyro (°/s), accel
+    (g), temperature (°C) from 64-byte reports.
+  • Gyro sparkline (canvas) with three colored traces
+    (Gx=red, Gy=green, Gz=blue), auto-scaled, collapsible.
+  • 3D head visualization (Three.js) – real-time orientation
+    tracking by integrating gyro angular velocity with damping
+    (0.998). Head, face, eyes, eyebrows, nose, mouth, glasses,
+    neck, ground shadow.
+  • IMU command builder: constructs 64-byte zero-padded packet
+    with CRC32 (polynomial 0xEDB88320) matching headset-utils
+    ImuRawPacket format.
+  • Multi-device HID support: all devices returned by
+    requestDevice({ vendorId: 0x3318 }) are opened and iterated
+    for sending commands.
+  • Scan HID reports button: tries IMU enable on every output/
+    feature report across all HID devices.
+  • Interface list with claimed status (✓/○).
+  • Debug to clipboard: exports USB, HID, polling, IMU state.
+  • Virtual-windowed packet list (max 200 DOM rows, 10k in
+    memory data array).
+
+── IMU Protocol Summary ──────────────────────────────────────
+  XREAL Air exposes 6 USB interfaces:
+    IF0/1 – Audio
+    IF2   – Audio (vendor)
+    IF3   – HID IMU     EP4 (IN 64B IMU data), EP5 (OUT 64B cmd)
+    IF4   – HID MCU     EP6 (IN 64B), EP7 (OUT 64B)
+    IF5   – HID         EP8 (IN 64B), EP9 (OUT 64B)
+
+  IMU Enable command (64 bytes):
+    [0]  – CRC32 (little-endian) of bytes 4-63
+    [4]  – 0x01 (cmd_id low)
+    [5]  – 0x02 (cmd_id high) → IMU_RUN=0x0102
+    [8]  – 0x01 (enable)
+    rest – zero-padded
+
+  IMU data report (64 bytes, EP 0x84):
+    Matches the voidcomputing.hu / headset-utils format:
+    gyro X/Y/Z at offsets 0x0C/0x10/0x14 (int16, °/s × 16),
+    accel X/Y/Z at offsets 0x18/0x1C/0x20 (int16, g × 1000),
+    temperature at offset 0x28 (int16, °C × 100).
+
+── Key Constraints ───────────────────────────────────────────
+  • Chrome marks HID class (0x03) USB interfaces as "protected
+    class" – WebUSB claimInterface() throws SecurityError.
+  • Therefore IMU enable command CANNOT go via WebUSB transferOut
+    on EP 0x05 (IF3). It succeeds through WebHID sendReport()
+    on the PIM collection (UP=0x41, likely IF4/MCU) – the MCU
+    presumably forwards it to the IMU.
+  • WebHID only exposes 1 collection (UP=0x41) via the device
+    picker – likely IF4, not IF3.
+
+── State ─────────────────────────────────────────────────────
+  ✓ IMU streaming is functional (confirmed working).
+  ✓ Three.js 3D head orientation updates from gyro data.
+  ✓ Virtual-windowed packet list.
+  Open issues: accelerometer-based drift correction not yet
+  implemented; orientation reset button not yet added.
+-->
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>USB Monitor — WebUSB Packet Inspector</title>
+<style>
+:root {
+  --bg-base: #0d1117;
+  --bg-surface: #161b22;
+  --bg-elevated: #1c2333;
+  --bg-hover: #21262d;
+  --border: #30363d;
+  --text: #e6edf3;
+  --text-dim: #8b949e;
+  --text-muted: #484f58;
+  --accent: #58a6ff;
+  --green: #3fb950;
+  --purple: #bc8cff;
+  --red: #f85149;
+  --orange: #d29922;
+  --cyan: #39d2c0;
+  --in-bg: #0d2d4a;
+  --in-text: #79c0ff;
+  --out-bg: #0d3a1e;
+  --out-text: #56d364;
+  --ctrl-bg: #2a1a4e;
+  --ctrl-text: #bc8cff;
+  --err-bg: #3d1214;
+  --err-text: #ff7b72;
+  --sys-bg: #1c2333;
+  --sys-text: #8b949e;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { height: 100%; overflow: hidden; background: var(--bg-base); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; font-size: 13px; line-height: 1.4; }
+
+#app { display: grid; grid-template-columns: 300px 1fr; grid-template-rows: auto 1fr auto; height: 100vh; }
+
+/* Toolbar */
+#toolbar {
+  grid-column: 1 / -1;
+  display: flex; align-items: center; gap: 12px;
+  padding: 6px 12px;
+  background: var(--bg-surface);
+  border-bottom: 1px solid var(--border);
+  font-size: 14px;
+}
+#toolbar h1 { font-size: 15px; font-weight: 600; letter-spacing: -0.02em; margin-right: auto; }
+#toolbar h1 span { color: var(--accent); }
+#device-name { font-size: 12px; }
+.status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; }
+.status-dot.disconnected { background: var(--text-muted); }
+.status-dot.connected { background: var(--green); box-shadow: 0 0 6px var(--green); }
+
+/* Sidebar */
+#sidebar {
+  background: var(--bg-surface);
+  border-right: 1px solid var(--border);
+  overflow-y: auto;
+  padding: 8px;
+}
+.section { margin-bottom: 8px; background: var(--bg-base); border: 1px solid var(--border); border-radius: 6px; }
+.section h3 {
+  font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em;
+  color: var(--text-dim); padding: 6px 8px; border-bottom: 1px solid var(--border);
+  cursor: pointer; user-select: none;
+  display: flex; align-items: center; gap: 4px;
+}
+.section h3 .toggle { transition: transform .15s; }
+.section h3 .toggle.collapsed { transform: rotate(-90deg); }
+.section-body { padding: 6px 8px; }
+.info-row { display: flex; justify-content: space-between; padding: 2px 0; font-size: 11px; }
+.info-row .label { color: var(--text-dim); }
+.info-row .value { color: var(--text); font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace; }
+select, input, button {
+  font-size: 12px;
+  background: var(--bg-elevated);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 8px;
+  outline: none;
+}
+select:focus, input:focus { border-color: var(--accent); }
+select:disabled, input:disabled { opacity: .5; }
+button {
+  cursor: pointer; font-weight: 500;
+  transition: background .15s, border-color .15s;
+}
+button:hover:not(:disabled) { background: var(--bg-hover); border-color: var(--text-muted); }
+button:active:not(:disabled) { transform: scale(.97); }
+button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+button.primary:hover:not(:disabled) { filter: brightness(1.15); }
+button.danger { color: var(--red); }
+button.danger:hover:not(:disabled) { background: var(--err-bg); border-color: var(--red); }
+.btn-row { display: flex; gap: 4px; margin-top: 4px; }
+.input-row { display: flex; align-items: center; gap: 6px; margin: 3px 0; }
+.input-row label { font-size: 11px; color: var(--text-dim); min-width: 70px; flex-shrink: 0; }
+.input-row input, .input-row select { flex: 1; min-width: 0; }
+.interface-item {
+  display: flex; align-items: center; gap: 6px;
+  padding: 3px 4px; margin: 2px 0;
+  font-size: 11px; border-radius: 4px;
+  cursor: pointer; transition: background .15s;
+}
+.interface-item:hover { background: var(--bg-hover); }
+.interface-item .if-num { font-family: monospace; color: var(--accent); }
+.interface-item .if-class { color: var(--text-dim); margin-left: auto; font-family: monospace; font-size: 10px; }
+.interface-item.active { background: var(--in-bg); }
+.badge {
+  display: inline-block; font-size: 9px; padding: 1px 4px; border-radius: 3px;
+  font-family: monospace; font-weight: 600;
+}
+.badge-in { background: var(--in-bg); color: var(--in-text); }
+.badge-out { background: var(--out-bg); color: var(--out-text); }
+.badge-ctrl { background: var(--ctrl-bg); color: var(--ctrl-text); }
+.badge-err { background: var(--err-bg); color: var(--err-text); }
+
+/* Active polls */
+.poll-item { display: flex; align-items: center; gap: 4px; padding: 3px 4px; font-size: 11px; background: var(--bg-elevated); border-radius: 4px; margin: 2px 0; }
+.poll-item .poll-ep { font-family: monospace; color: var(--green); }
+.poll-item .poll-stop { margin-left: auto; cursor: pointer; color: var(--red); font-size: 14px; line-height: 1; padding: 0 2px; }
+
+/* Main content */
+#content {
+  display: flex; flex-direction: column;
+  overflow: hidden;
+  background: var(--bg-base);
+}
+
+/* Packet list */
+#packet-list { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+#packet-list-header {
+  display: flex; align-items: center;
+  font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--border);
+  padding: 4px 8px;
+  background: var(--bg-surface);
+  flex-shrink: 0;
+}
+#packet-list-body { flex: 1; overflow-y: auto; }
+#packet-list-empty {
+  display: flex; align-items: center; justify-content: center;
+  flex: 1; color: var(--text-muted); font-size: 13px;
+  padding: 40px; text-align: center;
+}
+.col-num { width: 44px; flex-shrink: 0; }
+.col-time { width: 70px; flex-shrink: 0; }
+.col-dir { width: 32px; flex-shrink: 0; text-align: center; }
+.col-ep { width: 56px; flex-shrink: 0; }
+.col-type { width: 56px; flex-shrink: 0; }
+.col-len { width: 44px; flex-shrink: 0; text-align: right; }
+.col-data { flex: 1; min-width: 0; }
+
+.pkt-row {
+  display: flex; align-items: center;
+  font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
+  font-size: 11px;
+  padding: 2px 8px;
+  cursor: pointer;
+  border-bottom: 1px solid rgba(48,54,61,.5);
+  transition: background .1s;
+}
+.pkt-row:hover { background: var(--bg-hover); }
+.pkt-row.selected { background: var(--bg-elevated); outline: 1px solid var(--accent); outline-offset: -1px; }
+.pkt-row.dir-in { background: rgba(88,166,255,.04); }
+.pkt-row.dir-out { background: rgba(63,185,80,.04); }
+.pkt-row.dir-ctrl { background: rgba(188,140,255,.04); }
+.pkt-row.dir-err { background: rgba(248,81,73,.06); }
+.pkt-row.dir-sys { background: var(--sys-bg); opacity: 0.7; }
+.pkt-row .col-num { color: var(--text-muted); }
+.pkt-row .col-time { color: var(--text-dim); }
+.pkt-row .col-dir { font-weight: 700; }
+.pkt-row .col-dir.dir--in { color: var(--in-text); }
+.pkt-row .col-dir.dir--out { color: var(--out-text); }
+.pkt-row .col-dir.dir--ctrl { color: var(--ctrl-text); }
+.pkt-row .col-dir.dir--err { color: var(--err-text); }
+.pkt-row .col-dir.dir--sys { color: var(--sys-text); }
+.pkt-row .col-ep { color: var(--accent); font-weight: 500; }
+.pkt-row .col-type { font-size: 10px; color: var(--text-dim); }
+.pkt-row .col-type.type-control { color: var(--ctrl-text); }
+.pkt-row .col-type.type-interrupt { color: var(--in-text); }
+.pkt-row .col-type.type-bulk { color: var(--out-text); }
+.pkt-row .col-type.type-isochronous { color: var(--orange); }
+.pkt-row .col-len { color: var(--text-dim); }
+.pkt-row .col-data { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-dim); }
+
+/* Packet detail */
+#packet-detail {
+  border-top: 1px solid var(--border);
+  background: var(--bg-surface);
+  max-height: 40vh;
+  display: flex; flex-direction: column;
+}
+#packet-detail.hidden { display: none; }
+#packet-detail-header {
+  display: flex; align-items: center;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+#packet-detail-title { font-size: 12px; font-weight: 600; color: var(--accent); flex: 1; }
+#btn-close-detail { cursor: pointer; background: none; border: none; color: var(--text-dim); font-size: 18px; padding: 0 4px; }
+#btn-close-detail:hover { color: var(--text); }
+#packet-detail-body {
+  overflow-y: auto; padding: 8px 12px;
+  font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+  font-size: 12px;
+}
+#packet-detail-meta { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 8px; padding-bottom: 8px; border-bottom: 1px solid var(--border); }
+.detail-field { display: flex; gap: 4px; }
+.detail-field .df-label { color: var(--text-dim); }
+.detail-field .df-value { color: var(--text); }
+#packet-detail-hex { line-height: 1.6; white-space: pre; tab-size: 4; color: var(--text-dim); }
+#packet-detail-hex .hex-offset { color: var(--text-muted); }
+#packet-detail-hex .hex-bytes { color: var(--text); }
+#packet-detail-hex .hex-ascii { color: var(--text-muted); }
+
+/* Status bar */
+#statusbar {
+  grid-column: 1 / -1;
+  display: flex; align-items: center; gap: 12px;
+  padding: 4px 12px;
+  font-size: 11px; color: var(--text-dim);
+  background: var(--bg-surface);
+  border-top: 1px solid var(--border);
+}
+#statusbar-actions { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+#statusbar-actions label { display: flex; align-items: center; gap: 4px; cursor: pointer; }
+#statusbar-actions button {
+  font-size: 11px; padding: 2px 8px;
+}
+#status-paused { color: var(--orange); font-weight: 600; }
+
+/* Overlay for "no WebUSB" */
+#no-webusb {
+  display: none;
+  position: fixed; inset: 0;
+  background: var(--bg-base);
+  color: var(--text);
+  align-items: center; justify-content: center;
+  flex-direction: column; gap: 16px;
+  z-index: 100;
+}
+#no-webusb.show { display: flex; }
+#no-webusb h2 { color: var(--red); }
+#no-webusb p { color: var(--text-dim); max-width: 500px; text-align: center; }
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+.hidden { display: none !important; }
+
+/* IMU column */
+.col-imu { width: auto; min-width: 130px; flex-shrink: 1; font-size: 10px; text-align: left; }
+.pkt-row .col-imu { color: var(--cyan); font-size: 10px; white-space: nowrap; font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace; }
+
+/* IMU sparkline panel */
+#imu-panel {
+  flex-shrink: 0;
+  border-top: 1px solid var(--border);
+  background: var(--bg-surface);
+}
+#imu-panel.hidden { display: none; }
+#imu-panel-header {
+  display: flex; align-items: center; gap: 8px;
+  padding: 4px 12px;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer; user-select: none;
+}
+#imu-panel-header span { font-size: 11px; font-weight: 600; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.05em; }
+#imu-panel-header .toggle { transition: transform .15s; font-size: 10px; }
+#imu-panel-header .toggle.collapsed { transform: rotate(-90deg); }
+#imu-panel-body { padding: 4px; }
+#imu-canvas { display: block; width: 100%; height: 120px; background: var(--bg-base); border-radius: 4px; }
+.imu-legend { display: flex; gap: 16px; font-size: 10px; padding: 2px 8px 4px; }
+.imu-legend .legend-item { display: flex; align-items: center; gap: 4px; }
+.imu-legend .legend-dot { width: 8px; height: 8px; border-radius: 50%; }
+
+/* Responsive */
+@media (max-width: 720px) {
+  #app { grid-template-columns: 1fr; }
+  #sidebar { display: none; }
+}
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+
+<div id="no-webusb">
+  <h2>WebUSB Not Available</h2>
+  <p>This tool requires WebUSB, which is available only in secure contexts (HTTPS).<br>
+  Make sure you are accessing this page over HTTPS or localhost.</p>
+  <p style="font-size:11px;color:var(--text-muted)">Supported browsers: Chrome 61+, Edge 79+, Opera 48+</p>
+</div>
+
+<div id="app">
+  <header id="toolbar">
+    <h1>USB <span>Monitor</span></h1>
+    <select id="connect-type">
+      <option value="usb">USB</option>
+      <option value="hid" selected>HID</option>
+    </select>
+    <button id="btn-connect" class="primary">Connect</button>
+    <button id="btn-disconnect" class="danger" disabled>Disconnect</button>
+    <span id="device-name" class="text-dim">No device</span>
+    <span class="status-dot disconnected" id="status-dot"></span>
+  </header>
+
+  <aside id="sidebar">
+    <div class="section" id="sec-device">
+      <h3><span class="toggle">▼</span> Device</h3>
+      <div class="section-body" id="device-info">
+        <div class="info-row"><span class="label">Vendor ID</span><span class="value" id="did-vid">—</span></div>
+        <div class="info-row"><span class="label">Product ID</span><span class="value" id="did-pid">—</span></div>
+        <div class="info-row"><span class="label">Manufacturer</span><span class="value" id="did-mfr">—</span></div>
+        <div class="info-row"><span class="label">Product</span><span class="value" id="did-product">—</span></div>
+        <div class="info-row"><span class="label">Serial</span><span class="value" id="did-serial">—</span></div>
+        <div class="info-row"><span class="label">USB Version</span><span class="value" id="did-usbver">—</span></div>
+        <div class="info-row"><span class="label">Device Class</span><span class="value" id="did-class">—</span></div>
+      </div>
+    </div>
+
+    <div class="section" id="sec-interfaces">
+      <h3><span class="toggle">▼</span> Interfaces</h3>
+      <div class="section-body" id="interface-list">
+        <div class="text-muted" style="font-size:11px;padding:4px 0">No device connected</div>
+      </div>
+    </div>
+
+    <div class="section" id="sec-endpoints">
+      <h3><span class="toggle">▼</span> Endpoints</h3>
+      <div class="section-body" id="endpoint-list">
+        <div class="text-muted" style="font-size:11px;padding:4px 0">No device connected</div>
+      </div>
+    </div>
+
+    <div class="section" id="sec-poll">
+      <h3><span class="toggle">▼</span> Poll Interrupt IN</h3>
+      <div class="section-body">
+        <select id="poll-ep" disabled></select>
+        <div class="input-row" style="margin-top:4px">
+          <button id="btn-poll-start" class="primary" disabled>Start</button>
+          <button id="btn-poll-stop" disabled>Stop All</button>
+        </div>
+        <div id="active-polls" style="margin-top:4px"></div>
+      </div>
+    </div>
+
+    <div class="section" id="sec-send">
+      <h3><span class="toggle">▼</span> Send Data</h3>
+      <div class="section-body">
+        <select id="send-ep" disabled></select>
+        <div class="input-row" style="margin-top:4px">
+          <label>Report ID</label>
+          <input type="number" id="send-report-id" value="0" min="0" max="255" style="width:60px" disabled>
+        </div>
+        <div class="input-row" style="margin-top:4px">
+          <input type="text" id="send-hex" placeholder="Hex bytes, e.g. 01 02 FF" disabled>
+          <button id="btn-send" class="primary" disabled>Send</button>
+        </div>
+        <div style="display:flex;gap:4px;margin-top:4px">
+          <button id="btn-imu-enable" class="primary" style="flex:1;font-size:11px" disabled>
+            ▶ IMU Enable
+          </button>
+          <button id="btn-imu-disable" class="primary" style="flex:1;font-size:11px" disabled>
+            ■ IMU Disable
+          </button>
+        </div>
+        <div style="display:flex;gap:4px;margin-top:4px">
+          <button id="btn-imu-scan" style="flex:1;font-size:11px" disabled>
+            Scan HID reports
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <div class="section" id="sec-ctrl">
+      <h3><span class="toggle">▼</span> Control Transfer</h3>
+      <div class="section-body">
+        <div class="input-row"><select id="ctrl-type">
+          <option value="standard">Standard</option>
+          <option value="class">Class</option>
+          <option value="vendor">Vendor</option>
+        </select>
+        <select id="ctrl-recip">
+          <option value="device">Device</option>
+          <option value="interface">Interface</option>
+          <option value="endpoint">Endpoint</option>
+          <option value="other">Other</option>
+        </select></div>
+        <div class="input-row"><label>bReq</label><input type="number" id="ctrl-breq" value="0" min="0" max="255"></div>
+        <div class="input-row"><label>wVal</label><input type="number" id="ctrl-wval" value="0" min="0" max="65535"></div>
+        <div class="input-row"><label>wIdx</label><input type="number" id="ctrl-widx" value="0" min="0" max="65535"></div>
+        <div class="input-row"><label>Data</label><input type="text" id="ctrl-wdata" placeholder="Hex for OUT"></div>
+        <div class="input-row"><label>Length</label><input type="number" id="ctrl-length" value="64" min="0" max="65535"></div>
+        <div class="btn-row">
+          <button id="btn-ctrl-in">Control IN</button>
+          <button id="btn-ctrl-out">Control OUT</button>
+        </div>
+      </div>
+    </div>
+    <div class="section" style="border-top:none;margin-top:8px">
+      <div class="section-body" style="padding:4px">
+        <button id="btn-debug-clipboard" style="font-size:11px;width:100%">Debug to clipboard</button>
+      </div>
+    </div>
+    <div class="section" style="border-top:none;margin-top:4px">
+      <div class="section-header" style="cursor:pointer;font-size:11px;padding:4px 6px;display:flex;justify-content:space-between;align-items:center" onclick="toggleAbout()">
+        <span>About</span>
+        <span id="about-toggle" style="font-size:10px;color:var(--text-dim)">▸</span>
+      </div>
+      <div id="about-body" class="section-body" style="display:none;padding:6px;font-size:11px;line-height:1.5;color:var(--text-dim)">
+        <p style="margin:0 0 6px 0"><strong style="color:var(--text)">USB Monitor</strong> — WebUSB Packet Inspector for XREAL Air glasses. Single-file HTML app using WebUSB, WebHID, and Three.js.</p>
+        <p style="margin:0 0 6px 0">Captures and decodes IMU data from the glasses in real time: gyro (°/s), accelerometer (g), temperature (°C). Gyro sparkline and 3D head visualization.</p>
+        <p style="margin:0 0 6px 0">IMU enable command (64B CRC32) sends via WebUSB or WebHID. Chrome blocks HID class interfaces on WebUSB ("protected class"), so the IMU enable works through WebHID sendReport on the MCU collection.</p>
+        <p style="margin:0;color:var(--text-muted)">Connects to XREAL Air (vendor 0x3318). IF3 IMU data on EP 0x84.</p>
+      </div>
+    </div>
+  </aside>
+
+  <main id="content">
+    <div id="packet-list">
+      <div id="packet-list-header">
+        <span class="col-num">#</span>
+        <span class="col-time">Time</span>
+        <span class="col-dir">Dir</span>
+        <span class="col-ep">EP</span>
+        <span class="col-type">Type</span>
+        <span class="col-len">Len</span>
+        <span class="col-data">Data</span>
+        <span class="col-imu">IMU</span>
+      </div>
+      <div id="packet-list-body"></div>
+      <div id="packet-list-empty">
+        <p>No packets captured yet.<br>Connect a device and claim an interface to begin.</p>
+      </div>
+    </div>
+
+    <div id="imu-panel">
+      <div id="imu-panel-header">
+        <span class="toggle">▼</span>
+        <span>IMU Gyroscope</span>
+        <span id="imu-status" style="font-size:10px;color:var(--text-dim);font-weight:400;text-transform:none;letter-spacing:0">no data</span>
+      </div>
+      <div id="imu-panel-body">
+        <div style="display:flex;gap:4px;height:160px">
+          <div style="flex:1;display:flex;flex-direction:column">
+            <canvas id="imu-canvas" style="flex:1;display:block;background:var(--bg-base);border-radius:4px"></canvas>
+            <div class="imu-legend">
+              <span class="legend-item"><span class="legend-dot" style="background:#ff6b6b"></span> Gyro X</span>
+              <span class="legend-item"><span class="legend-dot" style="background:#51cf66"></span> Gyro Y</span>
+              <span class="legend-item"><span class="legend-dot" style="background:#339af0"></span> Gyro Z</span>
+              <span id="imu-values" style="margin-left:auto;font-family:monospace;color:var(--text-dim)"></span>
+            </div>
+          </div>
+          <div id="imu-3d-container" style="width:200px;height:100%;flex-shrink:0;background:var(--bg-base);border-radius:4px;position:relative;overflow:hidden">
+        </div>
+      </div>
+    </div>
+
+    <div id="packet-detail" class="hidden">
+      <div id="packet-detail-header">
+        <span id="packet-detail-title">Packet Detail</span>
+        <button id="btn-close-detail">✕</button>
+      </div>
+      <div id="packet-detail-body">
+        <div id="packet-detail-meta"></div>
+        <pre id="packet-detail-hex"></pre>
+      </div>
+    </div>
+  </main>
+
+  <footer id="statusbar">
+    <span id="status-packets">Packets: 0</span>
+    <span id="status-paused" class="hidden">⏸ PAUSED</span>
+    <div id="statusbar-actions">
+      <label><input type="checkbox" id="chk-autoscroll" checked> Auto-scroll</label>
+      <button id="btn-pause">⏸ Pause</button>
+      <button id="btn-clear">Clear</button>
+      <button id="btn-export">Export JSON</button>
+    </div>
+  </footer>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+
+function initImu3d() {
+  const container = document.getElementById('imu-3d-container');
+  if (!container) return;
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x161625);
+
+  const camera = new THREE.PerspectiveCamera(40, container.clientWidth / container.clientHeight, 0.1, 10);
+  camera.position.set(0, 0.2, 2.2);
+  camera.lookAt(0, 0, 0);
+
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.2;
+  container.appendChild(renderer.domElement);
+
+  // Lights
+  scene.add(new THREE.AmbientLight(0x404070, 0.4));
+  const key = new THREE.DirectionalLight(0xffffff, 2);
+  key.position.set(1.5, 2, 1.5);
+  key.castShadow = true;
+  scene.add(key);
+  const fill = new THREE.DirectionalLight(0x8888ff, 0.6);
+  fill.position.set(-1, 0.5, -1.5);
+  scene.add(fill);
+  const rim = new THREE.DirectionalLight(0x4488ff, 0.5);
+  rim.position.set(0, -1, -1);
+  scene.add(rim);
+
+  // Head group
+  const g = new THREE.Group();
+  scene.add(g);
+
+  // Head mesh
+  const headMat = new THREE.MeshStandardMaterial({ color: 0x8B7D6B, roughness: 0.6, metalness: 0.05 });
+  const head = new THREE.Mesh(new THREE.SphereGeometry(0.58, 32, 32), headMat);
+  head.scale.set(1, 0.92, 0.85);
+  g.add(head);
+
+  // Skin (slightly different shade for face)
+  const skinMat = new THREE.MeshStandardMaterial({ color: 0xC4A882, roughness: 0.55, metalness: 0 });
+  const face = new THREE.Mesh(new THREE.SphereGeometry(0.56, 32, 32), skinMat);
+  face.scale.set(0.95, 0.88, 0.82);
+  face.position.z = 0.02;
+  g.add(face);
+
+  // Eye whites
+  const whiteMat = new THREE.MeshStandardMaterial({ color: 0xf5f5f5, roughness: 0.3 });
+  const pupilMat = new THREE.MeshStandardMaterial({ color: 0x000000, roughness: 0.2 });
+  const irisMat = new THREE.MeshStandardMaterial({ color: 0x4a3728, roughness: 0.3 });
+  function addEye(x) {
+    const w = new THREE.Mesh(new THREE.SphereGeometry(0.1, 20, 20), whiteMat);
+    w.position.set(x, 0.12, 0.54);
+    g.add(w);
+    const iris = new THREE.Mesh(new THREE.SphereGeometry(0.065, 20, 20), irisMat);
+    iris.position.set(x, 0.13, 0.56);
+    g.add(iris);
+    const p = new THREE.Mesh(new THREE.SphereGeometry(0.04, 16, 16), pupilMat);
+    p.position.set(x, 0.13, 0.58);
+    g.add(p);
+  }
+  addEye(-0.16);
+  addEye(0.16);
+
+  // Eyebrows
+  const browMat = new THREE.MeshStandardMaterial({ color: 0x3a2a1a, roughness: 0.8 });
+  for (const x of [-0.2, 0.2]) {
+    const brow = new THREE.Mesh(new THREE.BoxGeometry(0.14, 0.02, 0.02), browMat);
+    brow.position.set(x, 0.26, 0.52);
+    brow.rotation.z = x < 0 ? 0.05 : -0.05;
+    g.add(brow);
+  }
+
+  // Nose
+  const noseMat = new THREE.MeshStandardMaterial({ color: 0xC4A882, roughness: 0.7 });
+  const nose = new THREE.Mesh(new THREE.ConeGeometry(0.055, 0.09, 8), noseMat);
+  nose.position.set(0, 0, 0.58);
+  nose.rotation.x = 0.2;
+  g.add(nose);
+  const noseTip = new THREE.Mesh(new THREE.SphereGeometry(0.025, 8, 8), noseMat);
+  noseTip.position.set(0, -0.02, 0.62);
+  g.add(noseTip);
+
+  // Mouth
+  const mouthMat = new THREE.MeshStandardMaterial({ color: 0xCC5555, roughness: 0.5 });
+  const mouth = new THREE.Mesh(new THREE.TorusGeometry(0.08, 0.012, 8, 16, Math.PI), mouthMat);
+  mouth.position.set(0, -0.15, 0.54);
+  mouth.rotation.x = Math.PI * 0.15;
+  g.add(mouth);
+  let smiling = false;
+  function setSmile(smile) {
+    if (smile === smiling) return;
+    smiling = smile;
+    mouth.scale.y = smile ? -1 : 1;
+  }
+
+  // Glasses frame (Nreal Air style)
+  const frameMat = new THREE.MeshStandardMaterial({ color: 0x222222, roughness: 0.3, metalness: 0.7 });
+  for (const x of [-0.2, 0.2]) {
+    const ring = new THREE.Mesh(new THREE.TorusGeometry(0.18, 0.025, 12, 24), frameMat);
+    ring.position.set(x, 0.1, 0.5);
+    ring.rotation.z = 0.02;
+    g.add(ring);
+    // lens tint
+    const lensMat = new THREE.MeshStandardMaterial({ color: 0x224466, roughness: 0.1, metalness: 0, transparent: true, opacity: 0.15, side: THREE.DoubleSide });
+    const lens = new THREE.Mesh(new THREE.CircleGeometry(0.16, 20), lensMat);
+    lens.position.set(x, 0.1, 0.51);
+    g.add(lens);
+  }
+  // Bridge
+  const bridge = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.025, 0.025), frameMat);
+  bridge.position.set(0, 0.1, 0.5);
+  g.add(bridge);
+  // Arms
+  for (const x of [-0.38, 0.38]) {
+    const arm = new THREE.Mesh(new THREE.BoxGeometry(0.35, 0.02, 0.02), frameMat);
+    arm.position.set(x * 1.5, 0.1, 0.2);
+    arm.rotation.y = -0.3 * Math.sign(x);
+    g.add(arm);
+  }
+
+  // Neck
+  const neckMat = new THREE.MeshStandardMaterial({ color: 0xC4A882, roughness: 0.8 });
+  const neck = new THREE.Mesh(new THREE.CylinderGeometry(0.2, 0.28, 0.25, 12), neckMat);
+  neck.position.set(0, -0.55, 0);
+  g.add(neck);
+
+  // Ground shadow
+  const shadowMat = new THREE.MeshStandardMaterial({ color: 0x000000, transparent: true, opacity: 0.15, roughness: 1, metalness: 0 });
+  const shadow = new THREE.Mesh(new THREE.CircleGeometry(0.6, 20), shadowMat);
+  shadow.rotation.x = -Math.PI / 2;
+  shadow.position.set(0, -0.65, 0);
+  g.add(shadow);
+
+  // Floating particles
+  const particleCount = 500;
+  const particleGeo = new THREE.BufferGeometry();
+  const basePos = new Float32Array(particleCount * 3);
+  const pPos = new Float32Array(particleCount * 3);
+  const pPhase = new Float32Array(particleCount * 3);
+  for (let i = 0; i < particleCount; i++) {
+    const theta = Math.random() * Math.PI * 2;
+    const phi = Math.acos(2 * Math.random() - 1);
+    const r = 0.8 + Math.random() * 1.5;
+    basePos[i * 3] = r * Math.sin(phi) * Math.cos(theta);
+    basePos[i * 3 + 1] = r * Math.cos(phi) * 0.6;
+    basePos[i * 3 + 2] = r * Math.sin(phi) * Math.sin(theta);
+    pPos[i * 3] = basePos[i * 3];
+    pPos[i * 3 + 1] = basePos[i * 3 + 1];
+    pPos[i * 3 + 2] = basePos[i * 3 + 2];
+    pPhase[i * 3] = Math.random() * Math.PI * 2;
+    pPhase[i * 3 + 1] = Math.random() * Math.PI * 2;
+    pPhase[i * 3 + 2] = Math.random() * Math.PI * 2;
+  }
+  particleGeo.setAttribute('position', new THREE.BufferAttribute(pPos, 3));
+  const particleMat = new THREE.PointsMaterial({
+    color: 0x88bbff,
+    size: 0.015,
+    transparent: true,
+    opacity: 0.3,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false
+  });
+  const particles = new THREE.Points(particleGeo, particleMat);
+  scene.add(particles);
+  let pTime = 0;
+
+  // Orientation state
+  let rX = 0, rY = 0, rZ = 0;
+  let lastTs = 0;
+
+  function setOrientation(gx, gy, gz, ts) {
+    if (lastTs === 0) { lastTs = ts; return; }
+    const dt = Math.min((ts - lastTs) / 1000, 0.05);
+    lastTs = ts;
+    const deg2rad = Math.PI / 180;
+    rX += gx * deg2rad * dt;
+    rY += gz * deg2rad * dt;
+    rZ += gy * deg2rad * dt;
+    // Damping to prevent drift while stationary
+    rX *= 0.998;
+    rY *= 0.998;
+    rZ *= 0.998;
+    // Apply with correct axis mapping: 
+    // gx = pitch (nod), gy = yaw (look), gz = roll (tilt)
+    g.rotation.x = rX;
+    g.rotation.y = rY;
+    g.rotation.z = rZ;
+  }
+
+  function resize() {
+    const w = container.clientWidth;
+    const h = container.clientHeight;
+    renderer.setSize(w, h);
+    camera.aspect = w / h;
+    camera.updateProjectionMatrix();
+  }
+
+  const ro = new ResizeObserver(resize);
+  ro.observe(container);
+  resize();
+
+  function animate() {
+    requestAnimationFrame(animate);
+    pTime += 0.008;
+    const amp = 0.04;
+    const pos = particles.geometry.attributes.position.array;
+    for (let i = 0; i < particleCount; i++) {
+      pos[i * 3] = basePos[i * 3] + Math.sin(pTime * 1.1 + pPhase[i * 3]) * amp;
+      pos[i * 3 + 1] = basePos[i * 3 + 1] + Math.sin(pTime * 0.9 + pPhase[i * 3 + 1]) * amp;
+      pos[i * 3 + 2] = basePos[i * 3 + 2] + Math.sin(pTime * 1.3 + pPhase[i * 3 + 2]) * amp;
+    }
+    particles.geometry.attributes.position.needsUpdate = true;
+    renderer.render(scene, camera);
+  }
+  animate();
+
+  function resetOrientation() {
+    rX = 0; rY = 0; rZ = 0;
+    lastTs = 0;
+    g.rotation.x = 0;
+    g.rotation.y = 0;
+    g.rotation.z = 0;
+  }
+
+  window.__imu3d = { setOrientation, resetOrientation, resize, setSmile };
+}
+try {
+  initImu3d();
+} catch (e) {
+  console.error('[3D] init failed:', e);
+  const c = document.getElementById('imu-3d-container');
+  if (c) c.innerHTML = '<div style="padding:8px;color:var(--red);font-size:11px">3D init error: '+e.message+'</div>';
+}
+</script>
+
+<script>
+(function() {
+  'use strict';
+
+  // ── State ──────────────────────────────────────────────
+  let device = null;
+  let hidDevice = null;
+  const hidDevices = [];
+  let packets = [];
+  let pktId = 0;
+  let t0 = 0;
+  let paused = false;
+  let selectedPkt = null;
+  let polling = {};
+
+  const MAX_PACKETS = 10000;
+  const MAX_VISIBLE_ROWS = 200;
+  const EMPTY_MSG = 'No packets captured yet.<br>Connect a device and claim an interface to begin.';
+
+  // ── DOM refs ───────────────────────────────────────────
+  const $ = id => document.getElementById(id);
+  const btnConnect = $('btn-connect');
+  const btnDisconnect = $('btn-disconnect');
+  const connectType = $('connect-type');
+  const deviceName = $('device-name');
+  const statusDot = $('status-dot');
+  const packetBody = $('packet-list-body');
+  const packetEmpty = $('packet-list-empty');
+  const pktDetail = $('packet-detail');
+  const pktDetailMeta = $('packet-detail-meta');
+  const pktDetailHex = $('packet-detail-hex');
+  const pktDetailTitle = $('packet-detail-title');
+  const statusPackets = $('status-packets');
+  const statusPaused = $('status-paused');
+  const chkAutoscroll = $('chk-autoscroll');
+  const btnPause = $('btn-pause');
+  const btnClear = $('btn-clear');
+  const btnExport = $('btn-export');
+  const pollEp = $('poll-ep');
+  const btnPollStart = $('btn-poll-start');
+  const btnPollStop = $('btn-poll-stop');
+  const activePolls = $('active-polls');
+  const sendEp = $('send-ep');
+  const sendReportId = $('send-report-id');
+  const sendHex = $('send-hex');
+  const btnSend = $('btn-send');
+  const btnImuEnable = $('btn-imu-enable');
+  const btnImuDisable = $('btn-imu-disable');
+  const btnImuScan = $('btn-imu-scan');
+  const interfaceList = $('interface-list');
+  const endpointList = $('endpoint-list');
+
+  // Device info fields
+  const did = { vid: $('did-vid'), pid: $('did-pid'), mfr: $('did-mfr'), prod: $('did-product'), serial: $('did-serial'), usbver: $('did-usbver'), cls: $('did-class') };
+
+  // ── WebUSB check ──────────────────────────────────────
+  if (!navigator.usb) {
+    document.getElementById('no-webusb').classList.add('show');
+    document.getElementById('app').style.display = 'none';
+    return;
+  }
+
+  // ── Helpers ────────────────────────────────────────────
+  function fmtHex(byte) { return byte.toString(16).padStart(2, '0'); }
+
+  function bytesToHex(data, max) {
+    const len = Math.min(data.length, max || data.length);
+    let s = '';
+    for (let i = 0; i < len; i++) s += fmtHex(data[i]) + ' ';
+    return s.trim();
+  }
+
+  function bytesToStr(data) {
+    let s = '';
+    for (let i = 0; i < Math.min(data.length, 64); i++) {
+      const b = data[i];
+      s += (b >= 32 && b <= 126) ? String.fromCharCode(b) : '.';
+    }
+    return s;
+  }
+
+  function hexDump(data) {
+    if (!data || !data.length) return '(no data)';
+    let out = '';
+    for (let off = 0; off < data.length; off += 16) {
+      const hex = [];
+      const asc = [];
+      for (let i = 0; i < 16; i++) {
+        if (off + i < data.length) {
+          const b = data[off + i];
+          hex.push(fmtHex(b));
+          asc.push(b >= 32 && b <= 126 ? String.fromCharCode(b) : '.');
+        } else {
+          hex.push('  ');
+          asc.push(' ');
+        }
+      }
+      const h = hex.slice(0, 8).join(' ') + '  ' + hex.slice(8).join(' ');
+      out += `<span class="hex-offset">${off.toString(16).padStart(4, '0')}</span>  `;
+      out += `<span class="hex-bytes">${h}</span>  `;
+      out += `<span class="hex-ascii">${asc.join('')}</span>\n`;
+    }
+    return out;
+  }
+
+  function now() { return performance.now(); }
+
+  function relTime(ms) {
+    const s = (ms / 1000).toFixed(3);
+    return s.padStart(9, ' ') + 's';
+  }
+
+  function classNameForType(type) {
+    switch (type) {
+      case 'control': return 'type-control';
+      case 'interrupt': return 'type-interrupt';
+      case 'bulk': return 'type-bulk';
+      case 'isochronous': return 'type-isochronous';
+      default: return '';
+    }
+  }
+
+  function decodeEpNumber(ep) {
+    return ep & 0x0f;
+  }
+
+  function epLabel(epNum, dir) {
+    return `EP${epNum} ${dir === 'in' ? '↓' : '↑'}`;
+  }
+
+  // ── Logging ────────────────────────────────────────────
+  function addPacket(dir, ep, type, data, status, label) {
+    if (paused) return null;
+    const id = ++pktId;
+    const entry = {
+      id,
+      time: t0 ? now() - t0 : 0,
+      dir, ep, type,
+      data: data instanceof Uint8Array ? data : new Uint8Array(data),
+      length: data.byteLength || 0,
+      status: status || 'ok',
+      label: label || ''
+    };
+    packets.push(entry);
+    if (packets.length > MAX_PACKETS) packets.splice(0, packets.length - MAX_PACKETS);
+    renderPacket(entry);
+    statusPackets.textContent = `Packets: ${pktId}`;
+    if (chkAutoscroll.checked) {
+      packetBody.scrollTop = packetBody.scrollHeight;
+    }
+    return entry;
+  }
+
+  function toggleAbout() {
+    const body = document.getElementById('about-body');
+    const toggle = document.getElementById('about-toggle');
+    const isOpen = body.style.display !== 'none';
+    body.style.display = isOpen ? 'none' : 'block';
+    toggle.textContent = isOpen ? '▸' : '▾';
+  }
+  window.toggleAbout = toggleAbout;
+
+  function addSystem(msg) {
+    addPacket('system', '—', 'system', new Uint8Array(0), 'ok', msg);
+  }
+
+  function addError(msg, err) {
+    console.error('[USB Monitor]', msg, err || '');
+    addPacket('err', '—', 'error', new Uint8Array(0), 'error', msg);
+  }
+
+  // ── Render packet rows ─────────────────────────────────
+  function renderPacket(entry) {
+    const empty = packetEmpty;
+    if (!empty.classList.contains('hidden')) empty.classList.add('hidden');
+
+    const row = document.createElement('div');
+    row.className = `pkt-row dir-${entry.dir}`;
+    row.dataset.id = entry.id;
+
+    const dirClass = `dir--${entry.dir}`;
+    const dataPreview = entry.length > 0 ? bytesToHex(entry.data, 8) : entry.label || '—';
+
+    const imuStr = entry.imu
+      ? `G:${entry.imu.gx.toFixed(0)} ${entry.imu.gy.toFixed(0)} ${entry.imu.gz.toFixed(0)}`
+      : '';
+    row.innerHTML = `
+      <span class="col-num">${entry.id}</span>
+      <span class="col-time">${relTime(entry.time)}</span>
+      <span class="col-dir ${dirClass}">${entry.dir === 'in' ? '←' : entry.dir === 'out' ? '→' : entry.dir === 'ctrl' ? '↔' : entry.dir === 'err' ? '✕' : '●'}</span>
+      <span class="col-ep">${entry.ep}</span>
+      <span class="col-type ${classNameForType(entry.type)}">${entry.type}</span>
+      <span class="col-len">${entry.length}</span>
+      <span class="col-data">${dataPreview}</span>
+      <span class="col-imu">${imuStr}</span>
+    `;
+
+    row.addEventListener('click', () => selectPacket(entry.id));
+    packetBody.appendChild(row);
+    // Virtual windowing: keep only MAX_VISIBLE_ROWS in the DOM
+    while (packetBody.children.length > MAX_VISIBLE_ROWS) {
+      packetBody.removeChild(packetBody.firstChild);
+    }
+  }
+
+  function selectPacket(id) {
+    const entry = packets.find(p => p.id === id);
+    if (!entry) return;
+    selectedPkt = id;
+    document.querySelectorAll('.pkt-row.selected').forEach(r => r.classList.remove('selected'));
+    const row = document.querySelector(`.pkt-row[data-id="${id}"]`);
+    if (row) row.classList.add('selected');
+    showDetail(entry);
+  }
+
+  // ── Packet detail ──────────────────────────────────────
+  function showDetail(entry) {
+    pktDetail.classList.remove('hidden');
+    pktDetailTitle.textContent = `Packet #${entry.id}`;
+    const cls = entry.dir === 'in' ? 'badge-in' : entry.dir === 'out' ? 'badge-out' : entry.dir === 'ctrl' ? 'badge-ctrl' : 'badge-err';
+    const imuHtml = entry.imu ? `
+      <span class="detail-field"><span class="df-label">Gyro:</span><span class="df-value" style="color:#ff6b6b">X ${entry.imu.gx.toFixed(1)}</span><span class="df-value" style="color:#51cf66">Y ${entry.imu.gy.toFixed(1)}</span><span class="df-value" style="color:#339af0">Z ${entry.imu.gz.toFixed(1)} °/s</span></span>
+      <span class="detail-field"><span class="df-label">Accel:</span><span class="df-value">X ${entry.imu.ax.toFixed(3)} Y ${entry.imu.ay.toFixed(3)} Z ${entry.imu.az.toFixed(3)} g</span></span>
+      <span class="detail-field"><span class="df-label">Temp:</span><span class="df-value">${entry.imu.temp.toFixed(1)} °C</span></span>
+    ` : '';
+    pktDetailMeta.innerHTML = `
+      <span class="detail-field"><span class="df-label">Direction:</span><span class="df-value"><span class="badge ${cls}">${entry.dir.toUpperCase()}</span></span></span>
+      <span class="detail-field"><span class="df-label">Time:</span><span class="df-value">${relTime(entry.time)}</span></span>
+      <span class="detail-field"><span class="df-label">Endpoint:</span><span class="df-value">${entry.ep}</span></span>
+      <span class="detail-field"><span class="df-label">Type:</span><span class="df-value">${entry.type}</span></span>
+      <span class="detail-field"><span class="df-label">Length:</span><span class="df-value">${entry.length} bytes</span></span>
+      <span class="detail-field"><span class="df-label">Status:</span><span class="df-value">${entry.status}</span></span>
+      ${entry.label ? `<span class="detail-field"><span class="df-label">Info:</span><span class="df-value">${entry.label}</span></span>` : ''}
+      ${imuHtml}
+    `;
+    pktDetailHex.innerHTML = entry.length > 0 ? hexDump(entry.data) : '(no data)';
+  }
+
+  // ── Clear ──────────────────────────────────────────────
+  function clearLog() {
+    packets = [];
+    imuHistory.length = 0;
+    scheduleImuChart();
+    const status = $('imu-status');
+    if (status) status.textContent = 'no data';
+    const vals = $('imu-values');
+    if (vals) vals.textContent = '';
+    packetBody.innerHTML = '';
+    packetEmpty.classList.remove('hidden');
+    pktDetail.classList.add('hidden');
+    selectedPkt = null;
+    statusPackets.textContent = 'Packets: 0';
+  }
+
+  // ── Export ─────────────────────────────────────────────
+  function exportJSON() {
+    const data = packets.map(p => ({
+      id: p.id, time: p.time, dir: p.dir, ep: p.ep,
+      type: p.type, length: p.length, status: p.status,
+      data: p.length > 0 ? Array.from(p.data) : [],
+      info: p.label || undefined
+    }));
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = `usb-capture-${Date.now()}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  // ── USB device ops ─────────────────────────────────────
+  async function connectDevice() {
+    const type = connectType.value;
+    if (type === 'hid') {
+      await connectHidDevice();
+    } else {
+      await connectUsbDevice();
+    }
+  }
+
+  async function connectUsbDevice() {
+    try {
+      const dev = await navigator.usb.requestDevice({ filters: [{}] });
+      await setupUsbDevice(dev);
+    } catch (err) {
+      if (err.name !== 'NotFoundError') addError('Connect: ' + err.message, err);
+    }
+  }
+
+  async function setupUsbDevice(dev) {
+    try {
+      if (device) await disconnectDevice();
+      device = dev;
+      await device.open();
+      // select first config
+      if (device.configurations.length > 0) {
+        await device.selectConfiguration(device.configurations[0].configurationValue);
+      }
+      t0 = now();
+      addSystem(`Connected (USB): ${device.productName || 'Unknown Device'}`);
+      updateDeviceInfo();
+      updateInterfaces();
+      updateEndpointsUI();
+      enableControls(true);
+      deviceName.textContent = device.productName || `0x${device.vendorId.toString(16)}:0x${device.productId.toString(16)}`;
+      statusDot.className = 'status-dot connected';
+      btnConnect.disabled = true;
+      btnDisconnect.disabled = false;
+      if (window.__imu3d) window.__imu3d.setSmile(true);
+    } catch (err) {
+      addError('Setup: ' + err.message, err);
+      device = null;
+    }
+  }
+
+  async function disconnectDevice() {
+    if (device) {
+      stopAllPolling();
+      try { await device.close(); } catch(e) {}
+      device = null;
+      addSystem('Disconnected (USB)');
+    }
+    while (hidDevices.length > 0) {
+      const d = hidDevices.pop();
+      try { await d.close(); } catch(e) {}
+    }
+    hidDevice = null;
+    enableControls(false);
+    deviceName.textContent = 'No device';
+    statusDot.className = 'status-dot disconnected';
+    btnConnect.disabled = false;
+    btnDisconnect.disabled = true;
+    clearDeviceInfo();
+    imuHistory.length = 0;
+    scheduleImuChart();
+    if (window.__imu3d) window.__imu3d.resetOrientation();
+    if (window.__imu3d) window.__imu3d.setSmile(false);
+    const status = $('imu-status');
+    if (status) status.textContent = 'no data';
+    const vals = $('imu-values');
+    if (vals) vals.textContent = '';
+    interfaceList.innerHTML = '<div class="text-muted" style="font-size:11px;padding:4px 0">No device connected</div>';
+    endpointList.innerHTML = '<div class="text-muted" style="font-size:11px;padding:4px 0">No device connected</div>';
+    pollEp.innerHTML = '<option value="">—</option>';
+    sendEp.innerHTML = '<option value="">—</option>';
+    pollEp.disabled = true; sendEp.disabled = true;
+  }
+
+  // ── HID device ops ─────────────────────────────────────
+  async function connectHidDevice() {
+    if (!navigator.hid) {
+      addError('WebHID not available in this browser');
+      return;
+    }
+    try {
+      const AIR_VID = 0x3318;
+      const devs = await navigator.hid.requestDevice({ filters: [{ vendorId: AIR_VID }] });
+      if (devs.length === 0) return;
+      for (const dev of devs) {
+        await setupHidDevice(dev);
+      }
+    } catch (err) {
+      if (err.name !== 'NotFoundError') addError('HID Connect: ' + err.message, err);
+    }
+  }
+
+  async function setupHidDevice(dev) {
+    try {
+      await dev.open();
+      hidDevices.push(dev);
+      if (!hidDevice) {
+        hidDevice = dev;
+        t0 = now();
+        enableControls(true);
+        deviceName.textContent = dev.productName || `0x${dev.vendorId.toString(16)}:0x${dev.productId.toString(16)}`;
+        statusDot.className = 'status-dot connected';
+        btnConnect.disabled = true;
+        btnDisconnect.disabled = false;
+        if (window.__imu3d) window.__imu3d.setSmile(true);
+      }
+      addSystem(`Connected (HID): ${dev.productName || 'Unknown'} (C${(dev.collections || []).length} collections)`);
+      updateHidDeviceInfo();
+      listenForHidReports(dev);
+    } catch (err) {
+      addError('HID Setup: ' + err.message, err);
+    }
+  }
+
+  function listenForHidReports(dev) {
+    if (!dev) return;
+    dev.addEventListener('inputreport', handleHidInputReport);
+  }
+
+  function handleHidInputReport(event) {
+    const { reportId, data } = event;
+    const bytes = new Uint8Array(data.buffer);
+    const imu = parseImuData(bytes);
+    const label = `Report ID: 0x${reportId.toString(16).padStart(2, '0')} (${bytes.length}B)` +
+      (imu ? ` G:${imu.gx.toFixed(0)} ${imu.gy.toFixed(0)} ${imu.gz.toFixed(0)}` : '');
+    const entry = addPacket('in', `HID`, 'interrupt', bytes, 'ok', label);
+    if (imu && entry) {
+      entry.imu = imu;
+      imuHistory.push(imu);
+      if (imuHistory.length > MAX_IMU_POINTS) imuHistory.shift();
+      scheduleImuChart();
+      updateImuStatus(imu);
+      if (window.__imu3d) window.__imu3d.setOrientation(imu.gx, imu.gy, imu.gz, performance.now());
+    }
+  }
+
+  function updateHidDeviceInfo() {
+    if (hidDevices.length === 0) return clearDeviceInfo();
+    const tot = hidDevices.reduce((n, d) => n + (d.collections || []).length, 0);
+    const d = hidDevices[0];
+    did.vid.textContent = '0x' + d.vendorId.toString(16).padStart(4, '0');
+    did.pid.textContent = '0x' + d.productId.toString(16).padStart(4, '0');
+    did.mfr.textContent = d.manufacturerName || '—';
+    did.prod.textContent = d.productName || '—';
+    did.serial.textContent = d.serialNumber || '—';
+    did.usbver.textContent = '— (HID)';
+    did.cls.textContent = `HID (${hidDevices.length} dev, ${tot} collections)`;
+    updateHidInterfaces();
+    updateHidEndpointsUI();
+  }
+
+  const usagePageNames = {
+    0x01: 'Generic Desktop', 0x02: 'Simulation', 0x03: 'VR',
+    0x04: 'Sport', 0x05: 'Game', 0x06: 'Generic Device',
+    0x07: 'Keyboard', 0x08: 'LED', 0x09: 'Button',
+    0x0a: 'Ordinal', 0x0b: 'Telephony', 0x0c: 'Consumer',
+    0x0d: 'Digitizer', 0x0e: 'Haptics', 0x0f: 'Physical Input',
+    0x10: 'Unicode', 0x14: 'Alphanumeric Display',
+    0x20: 'Sensors', 0x40: 'Medical Instrument',
+    0x80: 'Monitor', 0x84: 'Power Device',
+    0x90: 'Battery System', 0xff00: 'Vendor'
+  };
+
+  function usagePageName(page) {
+    return usagePageNames[page] || '0x' + page.toString(16).padStart(4, '0');
+  }
+
+  function updateHidInterfaces() {
+    if (hidDevices.length === 0) {
+      interfaceList.innerHTML = '<div class="text-muted" style="font-size:11px;padding:4px 0">No device connected</div>';
+      return;
+    }
+    let html = '';
+    let idx = 0;
+    for (let di = 0; di < hidDevices.length; di++) {
+      const cols = hidDevices[di].collections || [];
+      for (let ci = 0; ci < cols.length; ci++) {
+        const c = cols[ci];
+        const page = usagePageName(c.usagePage);
+        html += `<div class="interface-item" data-dev="${di}" data-col="${ci}">
+          <span class="if-num">D${di}C${ci}</span>
+          <span style="font-size:10px;color:var(--text-dim)">${page}:0x${c.usage.toString(16).padStart(4, '0')}</span>
+          <span class="if-class">${c.type || 'collection'}</span>
+        </div>`;
+        idx++;
+      }
+    }
+    if (idx === 0) html = '<div class="text-muted" style="font-size:11px;padding:6px 0">No collections</div>';
+    interfaceList.innerHTML = html;
+  }
+
+  function updateHidEndpointsUI() {
+    if (hidDevices.length === 0) {
+      endpointList.innerHTML = '<div class="text-muted" style="font-size:11px;padding:4px 0">No device connected</div>';
+      pollEp.innerHTML = '<option value="">—</option>';
+      sendEp.innerHTML = '<option value="">—</option>';
+      return;
+    }
+    const reports = [];
+    for (let di = 0; di < hidDevices.length; di++) {
+      const cols = hidDevices[di].collections || [];
+      for (let ci = 0; ci < cols.length; ci++) {
+        const col = cols[ci];
+        if (col.inputReports) {
+          for (const r of col.inputReports) {
+            reports.push({ dev: di, col: ci, usagePage: col.usagePage, usage: col.usage, dir: 'in', reportId: r.reportId, items: r.items });
+          }
+        }
+        if (col.outputReports) {
+          for (const r of col.outputReports) {
+            reports.push({ dev: di, col: ci, usagePage: col.usagePage, usage: col.usage, dir: 'out', reportId: r.reportId, items: r.items });
+          }
+        }
+        if (col.featureReports) {
+          for (const r of col.featureReports) {
+            reports.push({ dev: di, col: ci, usagePage: col.usagePage, usage: col.usage, dir: 'feature', reportId: r.reportId, items: r.items });
+          }
+        }
+      }
+    }
+    console.log('[USB Monitor] HID reports:', reports.map(r =>
+      `D${r.dev}C${r.col} UP=0x${r.usagePage.toString(16)} U=0x${r.usage.toString(16)} ${r.dir} R${r.reportId} ${Math.ceil(r.items.reduce((s, i) => s + (i.reportSize || 0) * (i.reportCount || 1), 0) / 8)}B`
+    ));
+
+    if (reports.length === 0) {
+      endpointList.innerHTML = '<div class="text-muted" style="font-size:11px;padding:4px 0">No reports</div>';
+      pollEp.innerHTML = '<option value="">No interrupt IN endpoints</option>';
+      sendEp.innerHTML = '<option value="">No OUT endpoints</option>';
+      return;
+    }
+
+    let html = '';
+    for (const r of reports) {
+      const totalSize = r.items.reduce((sum, item) => sum + (item.reportSize || 0) * (item.reportCount || 1), 0);
+      html += `<div style="display:flex;align-items:center;gap:4px;padding:2px 4px;font-size:11px;font-family:monospace">
+        <span class="badge badge-${r.dir === 'in' ? 'in' : 'out'}">${r.dir}</span>
+        <span style="color:var(--accent)">R${r.reportId}</span>
+        <span class="if-num" style="font-size:9px;color:var(--text-muted)">D${r.dev}C${r.col}</span>
+        <span style="color:var(--text-dim);margin-left:auto">${Math.ceil(totalSize / 8)}B</span>
+      </div>`;
+    }
+    endpointList.innerHTML = html;
+
+    // Reuse poll/send selectors for HID reports
+    const inReports = reports.filter(r => r.dir === 'in');
+    pollEp.innerHTML = inReports.length === 0
+      ? '<option value="">No IN reports</option>'
+      : '<option value="">Select report...</option>' + inReports.map(r =>
+        `<option value="${r.reportId}:in">R${r.reportId} IN</option>`
+      ).join('');
+
+    const outReports = reports.filter(r => r.dir === 'out' || r.dir === 'feature');
+    sendEp.innerHTML = outReports.length === 0
+      ? '<option value="">No OUT reports</option>'
+      : '<option value="">Select report...</option>' + outReports.map(r =>
+        `<option value="${r.reportId}:${r.dir}">R${r.reportId} ${r.dir.toUpperCase()}</option>`
+      ).join('');
+  }
+
+  function enableControls(en) {
+    document.querySelectorAll('#sidebar select, #sidebar input:not([disabled])').forEach(el => {
+      if (el.id === 'ctrl-breq' || el.id === 'ctrl-wval' || el.id === 'ctrl-widx' || el.id === 'ctrl-wdata' || el.id === 'ctrl-length') return;
+      if (el.closest('#sec-ctrl')) return;
+    });
+    pollEp.disabled = !en;
+    sendEp.disabled = !en;
+    sendReportId.disabled = !en;
+    sendHex.disabled = !en;
+    btnPollStart.disabled = !en;
+    btnSend.disabled = !en;
+    btnImuEnable.disabled = !en;
+    btnImuDisable.disabled = !en;
+    btnImuScan.disabled = !en;
+  }
+
+  // ── Device info ────────────────────────────────────────
+  function updateDeviceInfo() {
+    if (!device) return clearDeviceInfo();
+    const d = device;
+    did.vid.textContent = '0x' + d.vendorId.toString(16).padStart(4, '0');
+    did.pid.textContent = '0x' + d.productId.toString(16).padStart(4, '0');
+    did.mfr.textContent = d.manufacturerName || '—';
+    did.prod.textContent = d.productName || '—';
+    did.serial.textContent = d.serialNumber || '—';
+    const v = d.usbVersionMajor + '.' + d.usbVersionMinor + '.' + d.usbVersionSubminor;
+    did.usbver.textContent = v;
+    did.cls.textContent = '0x' + d.deviceClass.toString(16).padStart(2, '0') + (d.deviceClass === 0 ? ' (per-interface)' : '');
+  }
+
+  function clearDeviceInfo() {
+    Object.values(did).forEach(el => el.textContent = '—');
+  }
+
+  // ── Interfaces ─────────────────────────────────────────
+  function updateInterfaces() {
+    if (!device || !device.configuration) {
+      interfaceList.innerHTML = '<div class="text-muted" style="font-size:11px;padding:4px 0">No device connected</div>';
+      return;
+    }
+    const ifs = device.configuration.interfaces;
+    if (!ifs || ifs.length === 0) {
+      interfaceList.innerHTML = '<div class="text-muted" style="font-size:11px;padding:6px 0">No interfaces</div>';
+      return;
+    }
+    let html = '';
+    for (const iface of ifs) {
+      const alt = iface.alternate;
+      const cls = alt.interfaceClass;
+      const clsStr = '0x' + cls.toString(16).padStart(2, '0');
+      let clsName = classNames[cls] || '';
+      if (clsName) clsName = ' (' + clsName + ')';
+      html += `<div class="interface-item" data-if="${iface.interfaceNumber}">
+        <span class="if-num">IF${iface.interfaceNumber}</span>
+        <span style="font-size:10px;color:var(--text-dim)">Alt ${alt.alternateSetting}</span>
+        <span class="if-class">${clsStr}${clsName}</span>
+        <span class="if-claimed" style="font-size:9px;margin-left:auto;${iface.claimed ? 'color:#0c0' : 'color:var(--text-muted)'}">${iface.claimed ? '✓' : '○'}</span>
+      </div>`;
+    }
+    interfaceList.innerHTML = html;
+
+    // add claim toggle on click
+    interfaceList.querySelectorAll('.interface-item').forEach(el => {
+      el.addEventListener('click', async () => {
+        if (!device) return;
+        const ifNum = parseInt(el.dataset.if);
+        const isActive = el.classList.contains('active');
+        try {
+          if (isActive) {
+            await device.releaseInterface(ifNum);
+            el.classList.remove('active');
+            addSystem(`Released IF${ifNum}`);
+          } else {
+            await device.claimInterface(ifNum);
+            el.classList.add('active');
+            addSystem(`Claimed IF${ifNum}`);
+          }
+          updateEndpointsUI();
+        } catch (err) {
+          addError(`IF${ifNum}: ${err.message}`, err);
+        }
+      });
+    });
+  }
+
+  const classNames = {
+    0x00: 'Per-interface', 0x01: 'Audio', 0x02: 'CDC', 0x03: 'HID',
+    0x05: 'Physical', 0x06: 'Image', 0x07: 'Printer', 0x08: 'Mass Storage',
+    0x09: 'Hub', 0x0a: 'CDC Data', 0x0b: 'Smart Card', 0x0d: 'Content Security',
+    0x0e: 'Video', 0x0f: 'Personal Healthcare', 0x10: 'Audio/Video',
+    0xdc: 'Diagnostic', 0xe0: 'Wireless', 0xef: 'Misc', 0xfe: 'App Specific',
+    0xff: 'Vendor'
+  };
+
+  // ── Endpoints UI ───────────────────────────────────────
+  function updateEndpointsUI() {
+    const eps = enumerateEndpoints();
+    // endpoint list in sidebar
+    if (eps.length === 0) {
+      endpointList.innerHTML = '<div class="text-muted" style="font-size:11px;padding:4px 0">No endpoints</div>';
+    } else {
+      let html = '';
+      for (const ep of eps) {
+        const dirSym = ep.direction === 'in' ? '↓' : '↑';
+        const typeBadge = `badge-${ep.type === 'interrupt' ? 'in' : ep.type === 'bulk' ? 'out' : 'ctrl'}`;
+        html += `<div style="display:flex;align-items:center;gap:4px;padding:2px 4px;font-size:11px;font-family:monospace">
+          <span class="badge ${typeBadge}">${ep.type}</span>
+          <span style="color:var(--accent)">EP${ep.num} ${ep.direction}</span>
+          <span style="color:var(--text-dim);margin-left:auto">${ep.packetSize}B</span>
+        </div>`;
+      }
+      endpointList.innerHTML = html;
+    }
+
+    // poll selector
+    const interruptIn = eps.filter(e => e.type === 'interrupt' && e.direction === 'in');
+    pollEp.innerHTML = interruptIn.length === 0
+      ? '<option value="">No interrupt IN endpoints</option>'
+      : '<option value="">Select endpoint...</option>' + interruptIn.map(e =>
+        `<option value="${e.num}:${e.direction}">EP${e.num} IN (${e.packetSize}B)</option>`
+      ).join('');
+
+    // send selector (all OUT endpoints + interrupt IN)
+    const outEps = eps.filter(e => e.direction === 'out');
+    sendEp.innerHTML = outEps.length === 0
+      ? '<option value="">No OUT endpoints</option>'
+      : '<option value="">Select endpoint...</option>' + outEps.map(e =>
+        `<option value="${e.num}:${e.direction}">EP${e.num} ${e.direction.toUpperCase()} (${e.packetSize}B, ${e.type})</option>`
+      ).join('');
+  }
+
+  function enumerateEndpoints() {
+    if (!device || !device.configuration) return [];
+    const eps = [];
+    for (const iface of device.configuration.interfaces) {
+      const alt = iface.alternate;
+      for (const ep of alt.endpoints) {
+        eps.push({
+          num: ep.endpointNumber,
+          direction: ep.direction,
+          type: ep.type,
+          packetSize: ep.packetSize,
+          pollInterval: ep.pollInterval
+        });
+      }
+    }
+    return eps;
+  }
+
+  // ── Polling ────────────────────────────────────────────
+  btnPollStart.addEventListener('click', () => {
+    const val = pollEp.value;
+    if (!val || !device) return;
+    const [num, dir] = val.split(':');
+    const epNum = parseInt(num);
+    if (polling[epNum]) return;
+    polling[epNum] = true;
+    addPollUI(epNum);
+    addSystem(`Polling started on EP${epNum} IN (interrupt)`);
+    pollDevice(epNum);
+  });
+
+  btnPollStop.addEventListener('click', stopAllPolling);
+
+  function stopAllPolling() {
+    Object.keys(polling).forEach(k => { polling[k] = false; });
+    polling = {};
+    activePolls.innerHTML = '<div class="text-muted" style="font-size:10px;padding:2px 0">No active polls</div>';
+  }
+
+  function addPollUI(epNum) {
+    const div = document.createElement('div');
+    div.className = 'poll-item';
+    div.id = `poll-ui-${epNum}`;
+    div.innerHTML = `<span class="poll-ep">EP${epNum} ↓</span><span style="font-size:10px;color:var(--text-dim)">polling...</span><span class="poll-stop" data-ep="${epNum}">✕</span>`;
+    const emptyMsg = activePolls.querySelector('.text-muted');
+    if (emptyMsg) emptyMsg.remove();
+    activePolls.appendChild(div);
+    div.querySelector('.poll-stop').addEventListener('click', () => {
+      stopPoll(epNum);
+    });
+  }
+
+  function stopPoll(epNum) {
+    polling[epNum] = false;
+    const ui = document.getElementById(`poll-ui-${epNum}`);
+    if (ui) ui.remove();
+    if (activePolls.children.length === 0) {
+      activePolls.innerHTML = '<div class="text-muted" style="font-size:10px;padding:2px 0">No active polls</div>';
+    }
+  }
+
+  async function pollDevice(epNum) {
+    while (polling[epNum] && device) {
+      try {
+        const result = await device.transferIn(epNum, 64);
+        if (result.data && result.data.byteLength > 0) {
+          const bytes = new Uint8Array(result.data.buffer);
+          const entry = addPacket('in', `EP${epNum}`, 'interrupt', bytes, result.status);
+          const imu = parseImuData(bytes);
+          if (imu && entry) {
+            entry.imu = imu;
+            imuHistory.push(imu);
+            if (imuHistory.length > MAX_IMU_POINTS) imuHistory.shift();
+            scheduleImuChart();
+            updateImuStatus(imu);
+            if (window.__imu3d) window.__imu3d.setOrientation(imu.gx, imu.gy, imu.gz, performance.now());
+          }
+        }
+        if (result.status === 'stall') {
+          try { await device.clearHalt('in', epNum); } catch(e) {}
+        }
+      } catch (err) {
+        if (polling[epNum]) {
+          addError(`Poll EP${epNum}: ${err.message}`, err);
+          stopPoll(epNum);
+        }
+        break;
+      }
+    }
+  }
+
+  // ── Send ───────────────────────────────────────────────
+  btnSend.addEventListener('click', async () => {
+    const hex = sendHex.value.trim();
+    if (!hex) { addError('No data to send'); return; }
+    let bytes;
+    try {
+      bytes = hex.split(/\s+/).map(s => parseInt(s, 16));
+      if (bytes.some(isNaN)) { addError('Invalid hex'); return; }
+    } catch(e) { addError('Invalid hex', e); return; }
+    const data = new Uint8Array(bytes);
+
+    if (hidDevice) {
+      const reportId = parseInt(sendReportId.value) || 0;
+      try {
+        await hidDevice.sendReport(reportId, data);
+        addPacket('out', `HID`, 'interrupt', data, 'ok',
+          `Report ID: 0x${reportId.toString(16).padStart(2, '0')} (${data.length}B)`);
+        sendHex.value = '';
+      } catch (err) {
+        addError(`HID Send: ${err.message}`, err);
+      }
+    } else if (device && sendEp.value) {
+      const [num, dir] = sendEp.value.split(':');
+      const epNum = parseInt(num);
+      try {
+        await device.transferOut(epNum, data);
+        addPacket('out', `EP${epNum}`, 'bulk', data, 'ok');
+        sendHex.value = '';
+      } catch (err) {
+        addError(`Send EP${epNum}: ${err.message}`, err);
+      }
+    } else {
+      addError('No device connected');
+    }
+  });
+
+  // ── IMU commands ───────────────────────────────────────
+  // CRC-32 (same polynomial as Ethernet/PKZIP, 0xEDB88320)
+  // used by XREAL Air protocol as "CRC32(Adler)"
+  const crc32Table = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let crc = i;
+    for (let j = 0; j < 8; j++) crc = (crc & 1) ? (0xEDB88320 ^ (crc >>> 1)) : (crc >>> 1);
+    crc32Table[i] = crc;
+  }
+
+  function crc32(data) {
+    let crc = 0xFFFFFFFF;
+    for (let i = 0; i < data.length; i++) crc = crc32Table[(crc ^ data[i]) & 0xFF] ^ (crc >>> 8);
+    return crc ^ 0xFFFFFFFF;
+  }
+
+  // Build a 64-byte IMU command packet for the XREAL Air IMU endpoint (interface 3)
+  // Packet format:
+  //   0x00: 1B  header = 0xAA
+  //   0x01: 4B  checksum = CRC32 of bytes [5..(5+length)]
+  //   0x05: 2B  length = data.length + 3 (LE)
+  //   0x07: 1B  command ID
+  //   0x08: 56B command data (zero-padded)
+  // Total: 64 bytes
+  function buildImuCommand(cmdId, data) {
+    const buf = new Uint8Array(0x40);
+    const payload = new Uint8Array([cmdId, ...data]);
+    const length = data.length + 3;
+    buf[0] = 0xAA;
+    buf[5] = length & 0xFF;
+    buf[6] = (length >> 8) & 0xFF;
+    buf[7] = cmdId;
+    buf.set(data, 8);
+    // checksum over bytes [5..(5+length))
+    const chk = crc32(buf.slice(5, 5 + length));
+    buf[1] = chk & 0xFF;
+    buf[2] = (chk >> 8) & 0xFF;
+    buf[3] = (chk >> 16) & 0xFF;
+    buf[4] = (chk >> 24) & 0xFF;
+    return buf;
+  }
+
+  const IMU_IFACE = 3;
+  const IMU_EP_OUT = 0x05;
+
+  async function ensureImuInterfaceClaimed() {
+    if (!device) return false;
+    const cfg = device.configuration;
+    if (!cfg) return false;
+    const iface = cfg.interfaces.find(i => i.interfaceNumber === IMU_IFACE);
+    if (!iface) { addError(`Interface ${IMU_IFACE} not found on device`); return false; }
+    if (!iface.claimed) {
+      try {
+        await device.claimInterface(IMU_IFACE);
+        addSystem(`Claimed IF${IMU_IFACE} for IMU command`);
+      } catch (err) {
+        addError(`Cannot claim IF${IMU_IFACE}: ${err.message}`, err);
+        return false;
+      }
+    }
+    return true;
+  }
+
+  async function sendImuCommand(cmdId, cmdData) {
+    const buf = buildImuCommand(cmdId, cmdData);
+    const cmdName = cmdId === 0x19 ? (cmdData[0] ? 'Enable' : 'Disable') : `0x${cmdId.toString(16)}`;
+
+    // Try WebUSB first (EP 0x05 on interface 3)
+    if (device) {
+      const claimed = await ensureImuInterfaceClaimed();
+      if (claimed) {
+        console.log(`[USB Monitor] IMU cmd via USB: ${cmdName} → EP${IMU_EP_OUT}, ${buf.byteLength}B`, new Uint8Array(buf));
+        addSystem(`IMU cmd: ${cmdName} → EP${IMU_EP_OUT} (USB)`);
+        try {
+          await device.transferOut(IMU_EP_OUT, buf);
+          addPacket('out', `EP${IMU_EP_OUT}`, 'interrupt', buf, 'ok',
+            `IMU cmd: ${cmdName} (USB)`);
+          addSystem(`IMU command: ${cmdName} (USB) — OK`);
+          return;
+        } catch (err) {
+          addError(`IMU USB: ${err.message}`, err);
+        }
+      }
+    }
+
+    // Fallback: try every connected HID device
+    if (hidDevices.length === 0) { addError('No HID devices connected'); return; }
+    let sent = false;
+    for (const hd of hidDevices) {
+      for (const col of (hd.collections || [])) {
+        for (const r of (col.outputReports || [])) {
+          console.log(`[USB Monitor] Trying HID: R${r.reportId} out`, new Uint8Array(buf));
+          addSystem(`IMU cmd: ${cmdName} → R${r.reportId} out`);
+          try {
+            await hd.sendReport(r.reportId, buf);
+            addPacket('out', 'HID-IMU', 'interrupt', buf, 'ok', `IMU cmd: ${cmdName} (R${r.reportId} out)`);
+            addSystem(`IMU cmd: ${cmdName} (R${r.reportId} out) — OK`);
+            sent = true;
+          } catch (err) {
+            addSystem(`IMU cmd FAILED R${r.reportId} out: ${err.message}`);
+          }
+        }
+        for (const r of (col.featureReports || [])) {
+          console.log(`[USB Monitor] Trying HID: R${r.reportId} feature`, new Uint8Array(buf));
+          addSystem(`IMU cmd: ${cmdName} → R${r.reportId} feature`);
+          try {
+            await hd.sendFeatureReport(r.reportId, buf);
+            addPacket('out', 'HID-IMU', 'interrupt', buf, 'ok', `IMU cmd: ${cmdName} (R${r.reportId} feature)`);
+            addSystem(`IMU cmd: ${cmdName} (R${r.reportId} feature) — OK`);
+            sent = true;
+          } catch (err) {
+            addSystem(`IMU cmd FAILED R${r.reportId} feature: ${err.message}`);
+          }
+        }
+      }
+    }
+    if (!sent) addError('IMU HID: all reports failed');
+  }
+
+  async function tryImuOnAllReports() {
+    const buf = buildImuCommand(0x19, [0x01]);
+    for (const hd of hidDevices) {
+      for (const col of (hd.collections || [])) {
+        for (const r of (col.outputReports || [])) {
+          console.log(`[USB Monitor] Trying IMU enable on R${r.reportId} out...`);
+          addSystem(`Trying R${r.reportId} out...`);
+          try { await hd.sendReport(r.reportId, buf); addSystem(`R${r.reportId} out — OK!`); } catch (err) { addSystem(`R${r.reportId} out: ${err.message}`); }
+        }
+        for (const r of (col.featureReports || [])) {
+          console.log(`[USB Monitor] Trying IMU enable on R${r.reportId} feature...`);
+          addSystem(`Trying R${r.reportId} feature...`);
+          try { await hd.sendFeatureReport(r.reportId, buf); addSystem(`R${r.reportId} feature — OK!`); } catch (err) { addSystem(`R${r.reportId} feature: ${err.message}`); }
+        }
+      }
+    }
+  }
+
+  btnImuEnable.addEventListener('click', () => sendImuCommand(0x19, [0x01]));
+  btnImuDisable.addEventListener('click', () => sendImuCommand(0x19, [0x00]));
+  btnImuScan.addEventListener('click', tryImuOnAllReports);
+
+  // ── Debug to clipboard ─────────────────────────────────
+  function debugToClipboard() {
+    const lines = [];
+    const t = now();
+
+    lines.push('=== USB Monitor Debug Report ===');
+    lines.push(`Generated: ${new Date().toISOString()}`);
+    lines.push(`Uptime: ${((t - t0) / 1000).toFixed(1)}s`);
+    lines.push('');
+
+    // USB device
+    lines.push('--- USB Device ---');
+    if (device) {
+      lines.push(`VID: 0x${device.vendorId.toString(16).padStart(4, '0')}`);
+      lines.push(`PID: 0x${device.productId.toString(16).padStart(4, '0')}`);
+      lines.push(`Manufacturer: ${device.manufacturerName || '-'}`);
+      lines.push(`Product: ${device.productName || '-'}`);
+      lines.push(`Serial: ${device.serialNumber || '-'}`);
+      lines.push(`USB Version: ${device.usbVersionMajor}.${device.usbVersionMinor}.${device.usbVersionSubminor}`);
+      lines.push(`Device Class: 0x${device.deviceClass.toString(16).padStart(2, '0')}${device.deviceClass === 0 ? ' (per-interface)' : ''}`);
+      if (device.configuration) {
+        lines.push(`Config value: ${device.configuration.configurationValue}`);
+        for (const iface of device.configuration.interfaces) {
+          const alt = iface.alternate;
+          const clsName = classNames[alt.interfaceClass] || '';
+          const eps = alt.endpoints.map(e => `EP${e.endpointNumber}${e.direction === 'in' ? '→' : '←'} ${e.type} ${e.packetSize}B`).join(', ');
+          lines.push(`  IF${iface.interfaceNumber} ${iface.claimed ? '[claimed]' : '[unclaimed]'} 0x${alt.interfaceClass.toString(16).padStart(2, '0')}${clsName ? ' ' + clsName : ''} ${eps}`);
+        }
+      }
+    } else {
+      lines.push('No USB device connected');
+    }
+    lines.push('');
+
+    // HID devices
+    lines.push(`--- HID Devices (${hidDevices.length}) ---`);
+    if (hidDevices.length === 0) {
+      lines.push('No HID devices connected');
+    } else {
+      for (let di = 0; di < hidDevices.length; di++) {
+        const hd = hidDevices[di];
+        lines.push(`[${di}] Product: ${hd.productName || '-'}`);
+        lines.push(`    VID: 0x${hd.vendorId.toString(16).padStart(4, '0')}, PID: 0x${hd.productId.toString(16).padStart(4, '0')}`);
+        lines.push(`    Collections: ${(hd.collections || []).length}`);
+        for (let ci = 0; ci < (hd.collections || []).length; ci++) {
+          const col = hd.collections[ci];
+          lines.push(`    C${ci} UP=0x${col.usagePage.toString(16)} U=0x${col.usage.toString(16)}`);
+          for (const r of (col.inputReports || [])) lines.push(`      IN R${r.reportId}`);
+          for (const r of (col.outputReports || [])) lines.push(`      OUT R${r.reportId}`);
+          for (const r of (col.featureReports || [])) lines.push(`      FEATURE R${r.reportId}`);
+        }
+      }
+    }
+    lines.push('');
+
+    // Polling
+    lines.push('--- Polling ---');
+    const pollKeys = Object.keys(polling);
+    if (pollKeys.length === 0) {
+      lines.push('No active polls');
+    } else {
+      for (const ep of pollKeys) {
+        lines.push(`  EP${ep}: ${polling[ep] ? 'active' : 'stopped'}`);
+      }
+    }
+    lines.push('');
+
+    // IMU
+    lines.push('--- IMU ---');
+    lines.push(`History points: ${imuHistory.length}`);
+    if (imuHistory.length > 0) {
+      const last = imuHistory[imuHistory.length - 1];
+      lines.push(`Last: Gx=${last.gx.toFixed(1)} Gy=${last.gy.toFixed(1)} Gz=${last.gz.toFixed(1)} °/s`);
+    }
+    lines.push('');
+
+    // Web APIs
+    lines.push('--- Browser APIs ---');
+    lines.push(`WebUSB: ${typeof navigator.usb !== 'undefined' ? 'available' : 'UNAVAILABLE'}`);
+    lines.push(`WebHID: ${typeof navigator.hid !== 'undefined' ? 'available' : 'UNAVAILABLE'}`);
+    lines.push(`User Agent: ${navigator.userAgent}`);
+    lines.push('');
+
+    lines.push('=== End Report ===');
+
+    const text = lines.join('\n');
+    navigator.clipboard.writeText(text)
+      .then(() => addSystem(`Debug report copied to clipboard (${lines.length} lines)`))
+      .catch(err => addError(`Clipboard: ${err.message}`, err));
+  }
+
+  $('btn-debug-clipboard').addEventListener('click', debugToClipboard);
+
+  // ── Control transfers ──────────────────────────────────
+  function buildCtrlSetup() {
+    return {
+      requestType: $('ctrl-type').value,
+      recipient: $('ctrl-recip').value,
+      request: parseInt($('ctrl-breq').value) || 0,
+      value: parseInt($('ctrl-wval').value) || 0,
+      index: parseInt($('ctrl-widx').value) || 0
+    };
+  }
+
+  $('btn-ctrl-in').addEventListener('click', async () => {
+    if (!device) return;
+    const setup = buildCtrlSetup();
+    const length = parseInt($('ctrl-length').value) || 64;
+    try {
+      const result = await device.controlTransferIn(setup, length);
+      const data = result.data ? new Uint8Array(result.data.buffer) : new Uint8Array(0);
+      const label = `CTRL IN: reqType=${setup.requestType} bReq=0x${setup.request.toString(16)} wVal=0x${setup.value.toString(16)} wIdx=0x${setup.index.toString(16)}`;
+      addPacket('ctrl', 'EP0', 'control', data, result.status, label);
+    } catch (err) {
+      addError(`Control IN: ${err.message}`, err);
+    }
+  });
+
+  $('btn-ctrl-out').addEventListener('click', async () => {
+    if (!device) return;
+    const setup = buildCtrlSetup();
+    const hex = $('ctrl-wdata').value.trim();
+    let data = new Uint8Array(0);
+    if (hex) {
+      const bytes = hex.split(/\s+/).map(s => parseInt(s, 16));
+      if (bytes.some(isNaN)) { addError('Invalid hex data'); return; }
+      data = new Uint8Array(bytes);
+    }
+    try {
+      const result = await device.controlTransferOut(setup, data);
+      const label = `CTRL OUT: reqType=${setup.requestType} bReq=0x${setup.request.toString(16)} wVal=0x${setup.value.toString(16)} wIdx=0x${setup.index.toString(16)}`;
+      addPacket('ctrl', 'EP0', 'control', data, result.status, label);
+    } catch (err) {
+      addError(`Control OUT: ${err.message}`, err);
+    }
+  });
+
+  // ── Event listeners ────────────────────────────────────
+  btnConnect.addEventListener('click', connectDevice);
+  btnDisconnect.addEventListener('click', disconnectDevice);
+  btnClear.addEventListener('click', clearLog);
+  btnExport.addEventListener('click', exportJSON);
+  $('btn-close-detail').addEventListener('click', () => {
+    pktDetail.classList.add('hidden');
+    selectedPkt = null;
+    document.querySelectorAll('.pkt-row.selected').forEach(r => r.classList.remove('selected'));
+  });
+
+  btnPause.addEventListener('click', () => {
+    paused = !paused;
+    btnPause.textContent = paused ? '▶ Resume' : '⏸ Pause';
+    statusPaused.classList.toggle('hidden', !paused);
+  });
+
+  // Collapsible sections
+  document.querySelectorAll('.section h3').forEach(h3 => {
+    h3.addEventListener('click', () => {
+      const body = h3.nextElementSibling;
+      const toggle = h3.querySelector('.toggle');
+      body.style.display = body.style.display === 'none' ? '' : 'none';
+      if (toggle) toggle.classList.toggle('collapsed');
+    });
+  });
+
+  // Auto-reconnect for previously authorized devices — disabled to avoid stale state
+  // window.addEventListener('load', async () => {
+  //   try {
+  //     const devices = await navigator.usb.getDevices();
+  //     if (devices.length > 0) {
+  //       await setupUsbDevice(devices[0]);
+  //     }
+  //   } catch(e) {}
+  //   try {
+  //     const hidDevices = await navigator.hid.getDevices();
+  //     if (hidDevices.length > 0) {
+  //       await setupHidDevice(hidDevices[0]);
+  //     }
+  //   } catch(e) {}
+  // });
+
+  // Listen for device connect/disconnect
+  navigator.usb.addEventListener('disconnect', (event) => {
+    if (device && event.device === device) {
+      addSystem('Device disconnected (removed)');
+      disconnectDevice();
+    }
+  });
+
+  navigator.usb.addEventListener('connect', (event) => {
+    addSystem(`Device connected: ${event.device.productName || 'Unknown'}`);
+    // optionally auto-connect
+  });
+
+  // ── IMU parsing ────────────────────────────────────────
+  function readInt24(data, offset) {
+    if (offset + 3 > data.length) return 0;
+    let val = data[offset] | (data[offset + 1] << 8) | (data[offset + 2] << 16);
+    if (val & 0x800000) val -= 0x1000000;
+    return val;
+  }
+
+  function readInt16(data, offset) {
+    if (offset + 2 > data.length) return 0;
+    return data[offset] | (data[offset + 1] << 8);
+  }
+
+  function readInt32(data, offset) {
+    if (offset + 4 > data.length) return 0;
+    return data[offset] | (data[offset + 1] << 8) | (data[offset + 2] << 16) | (data[offset + 3] << 24);
+  }
+
+  function isImuPacket(data) {
+    return data.length >= 4 && data[0] === 0x01 && data[1] === 0x02;
+  }
+
+  function parseImuData(data) {
+    if (!isImuPacket(data)) return null;
+
+    const rawGx = readInt24(data, 0x12);
+    const rawGy = readInt24(data, 0x15);
+    const rawGz = readInt24(data, 0x18);
+    const gMult = readInt16(data, 0x0C);
+    const gDiv = readInt32(data, 0x0E);
+    const gx = gDiv !== 0 ? (rawGx * gMult) / gDiv : 0;
+    const gy = gDiv !== 0 ? (rawGy * gMult) / gDiv : 0;
+    const gz = gDiv !== 0 ? (rawGz * gMult) / gDiv : 0;
+
+    const rawAx = readInt24(data, 0x21);
+    const rawAy = readInt24(data, 0x24);
+    const rawAz = readInt24(data, 0x27);
+    const aMult = readInt16(data, 0x1B);
+    const aDiv = readInt32(data, 0x1D);
+    const ax = aDiv !== 0 ? (rawAx * aMult) / aDiv : 0;
+    const ay = aDiv !== 0 ? (rawAy * aMult) / aDiv : 0;
+    const az = aDiv !== 0 ? (rawAz * aMult) / aDiv : 0;
+
+    const rawMx = readInt16(data, 0x30);
+    const rawMy = readInt16(data, 0x32);
+    const rawMz = readInt16(data, 0x34);
+    const mOff = readInt16(data, 0x2A);
+    const mDiv = readInt32(data, 0x2C);
+    const mx = mDiv !== 0 ? (rawMx - mOff) / mDiv : 0;
+    const my = mDiv !== 0 ? (rawMy - mOff) / mDiv : 0;
+    const mz = mDiv !== 0 ? (rawMz - mOff) / mDiv : 0;
+
+    const temp = readInt16(data, 0x02);
+    const tempC = temp !== 0 ? temp / 326.8 + 25.0 : 0;
+
+    return { gx, gy, gz, ax, ay, az, mx, my, mz, temp: tempC };
+  }
+
+  // ── IMU sparkline ──────────────────────────────────────
+  const imuHistory = [];
+  const MAX_IMU_POINTS = 200;
+  let imuChartFrame = null;
+
+  function updateImuStatus(imu) {
+    const status = $('imu-status');
+    if (status) status.textContent = `${imuHistory.length} samples`;
+    const vals = $('imu-values');
+    if (vals) vals.textContent = `G: ${imu.gx.toFixed(0)} ${imu.gy.toFixed(0)} ${imu.gz.toFixed(0)} °/s`;
+  }
+
+  function drawImuChart() {
+    const canvas = $('imu-canvas');
+    if (!canvas) return;
+    const container = canvas.parentElement;
+    const cw = container.clientWidth;
+    if (cw === 0) return;
+    const dpr = window.devicePixelRatio || 1;
+    const drawW = cw;
+    const drawH = 120;
+    canvas.width = drawW * dpr;
+    canvas.height = drawH * dpr;
+    canvas.style.width = drawW + 'px';
+    canvas.style.height = drawH + 'px';
+    const ctx = canvas.getContext('2d');
+    const w = canvas.width;
+    const h = canvas.height;
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, drawW, drawH);
+
+    if (imuHistory.length < 2) {
+      ctx.fillStyle = '#484f58';
+      ctx.font = '11px -apple-system, BlinkMacSystemFont, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('Waiting for IMU data...', drawW / 2, drawH / 2 + 4);
+      return;
+    }
+
+    const data = imuHistory;
+    let min = Infinity, max = -Infinity;
+    for (const p of data) {
+      if (p.gx < min) min = p.gx;
+      if (p.gy < min) min = p.gy;
+      if (p.gz < min) min = p.gz;
+      if (p.gx > max) max = p.gx;
+      if (p.gy > max) max = p.gy;
+      if (p.gz > max) max = p.gz;
+    }
+    const range = max - min || 1;
+    const pad = range * 0.1;
+    const yMin = min - pad;
+    const yMax = max + pad;
+
+    // grid lines
+    ctx.strokeStyle = '#21262d';
+    ctx.lineWidth = 1;
+    for (let i = 0; i <= 4; i++) {
+      const y = (i / 4) * drawH;
+      ctx.beginPath();
+      ctx.moveTo(0, y);
+      ctx.lineTo(drawW, y);
+      ctx.stroke();
+    }
+
+    const lines = [
+      { color: '#ff6b6b', get: p => p.gx },
+      { color: '#51cf66', get: p => p.gy },
+      { color: '#339af0', get: p => p.gz },
+    ];
+
+    for (const line of lines) {
+      ctx.beginPath();
+      ctx.strokeStyle = line.color;
+      ctx.lineWidth = 1.5;
+      ctx.lineJoin = 'round';
+      ctx.lineCap = 'round';
+      let started = false;
+      for (let i = 0; i < data.length; i++) {
+        const x = (i / (data.length - 1)) * drawW;
+        const y = ((yMax - line.get(data[i])) / (yMax - yMin)) * drawH;
+        if (!started) { ctx.moveTo(x, y); started = true; }
+        else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+    }
+
+    // y-axis labels
+    ctx.fillStyle = '#484f58';
+    ctx.font = '9px -apple-system, BlinkMacSystemFont, sans-serif';
+    ctx.textAlign = 'right';
+    ctx.fillText(yMax.toFixed(0) + '°/s', drawW - 4, 8);
+    ctx.fillText(yMin.toFixed(0) + '°/s', drawW - 4, drawH - 2);
+  }
+
+  function scheduleImuChart() {
+    if (imuChartFrame) return;
+    imuChartFrame = requestAnimationFrame(() => {
+      imuChartFrame = null;
+      drawImuChart();
+    });
+  }
+
+  // collapsible IMU panel
+  document.addEventListener('DOMContentLoaded', () => {
+    const hdr = $('imu-panel-header');
+    if (hdr) {
+      hdr.addEventListener('click', () => {
+        const body = $('imu-panel-body');
+        const toggle = hdr.querySelector('.toggle');
+        if (body) body.style.display = body.style.display === 'none' ? '' : 'none';
+        if (toggle) toggle.classList.toggle('collapsed');
+        scheduleImuChart();
+      });
+    }
+  });
+
+  // resize observer for sparkline
+  if (window.ResizeObserver) {
+    const ro = new ResizeObserver(() => scheduleImuChart());
+    const canvas = $('imu-canvas');
+    if (canvas) ro.observe(canvas.parentElement);
+  }
+  window.addEventListener('resize', scheduleImuChart);
+
+  // ── Init UI ────────────────────────────────────────────
+  enableControls(false);
+
+})();
+</script>
+</body>
+</html>
