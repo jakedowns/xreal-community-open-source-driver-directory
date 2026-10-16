@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>XREAL Air — Web Bridge Demo</title>
+<style>
+  :root { --bg:#0b0f16; --fg:#e6edf3; --dim:#8b949e; --acc:#58a6ff; --ok:#3fb950; --bad:#f85149; --warn:#d29922; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  html,body { height:100%; overflow:hidden; background:var(--bg); color:var(--fg);
+    font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+  canvas { display:block; width:100vw; height:100vh; }
+  .hud { position:fixed; padding:8px 10px; border:1px solid #30363d; border-radius:8px;
+    background:rgba(13,17,23,.82); backdrop-filter:blur(6px); font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:11px; }
+  #status { top:12px; left:12px; }
+  #controls { top:12px; right:12px; }
+  #pose { bottom:12px; left:12px; }
+  #conn { bottom:12px; right:12px; }
+  .row { display:flex; gap:8px; align-items:center; }
+  .dot { width:8px; height:8px; border-radius:50%; background:var(--dim); flex:none; }
+  .dot.on { background:var(--ok); box-shadow:0 0 8px var(--ok); }
+  .dot.off { background:var(--bad); }
+  .k { color:var(--dim); }
+  .v { color:var(--acc); }
+  label { display:flex; gap:5px; align-items:center; cursor:pointer; user-select:none; }
+  label:hover { color:var(--acc); }
+  input[type=checkbox] { accent-color:var(--acc); }
+  button { font:inherit; background:#161b22; color:var(--fg); border:1px solid #30363d;
+    border-radius:5px; padding:2px 8px; cursor:pointer; }
+  button:hover { border-color:var(--acc); color:var(--acc); }
+  #offline { position:fixed; inset:0; display:none; place-items:center; pointer-events:none; }
+  #offline.show { display:grid; }
+  #offline div { text-align:center; }
+  #offline h2 { color:var(--bad); font-size:18px; margin-bottom:8px; }
+  #offline p { color:var(--dim); max-width:460px; }
+  .grid { display:grid; grid-template-columns:auto auto; gap:2px 10px; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div class="hud" id="status">
+  <div class="row"><span class="dot" id="dot"></span><strong id="state">connecting…</strong></div>
+  <div class="grid" style="margin-top:6px">
+    <span class="k">source</span> <span class="v" id="src">—</span>
+    <span class="k">msgs</span>   <span class="v" id="msgs">0</span>
+    <span class="k">rate</span>   <span class="v" id="hz">0.0 Hz</span>
+    <span class="k">latency</span><span class="v" id="lat">—</span>
+  </div>
+</div>
+
+<div class="hud" id="controls">
+  <div class="row" style="margin-bottom:6px"><strong>invert</strong>
+    <label><input type="checkbox" id="iy"> yaw</label>
+    <label><input type="checkbox" id="ip"> pitch</label>
+    <label><input type="checkbox" id="ir"> roll</label>
+  </div>
+  <div class="row">
+    <button id="reset">reset pose</button>
+    <button id="reconnect">reconnect</button>
+  </div>
+</div>
+
+<div class="hud" id="pose">
+  <div class="grid">
+    <span class="k">yaw</span>   <span class="v" id="py">0.0°</span>
+    <span class="k">pitch</span> <span class="v" id="pp">0.0°</span>
+    <span class="k">roll</span>  <span class="v" id="pr">0.0°</span>
+  </div>
+</div>
+
+<div class="hud" id="conn">
+  <div class="k">ws://<span id="wsurl">—</span></div>
+</div>
+
+<div id="offline"><div>
+  <h2>Bridge not connected</h2>
+  <p>Start it with <code>python3 bridge/bridge.py</code> and serve this page over
+     <code>http://localhost:8000</code>. The page reconnects automatically.</p>
+</div></div>
+
+<script>
+'use strict';
+
+// ----- config -------------------------------------------------------------
+const qs = new URLSearchParams(location.search);
+const WS_HOST = qs.get('host') || (location.hostname || '127.0.0.1');
+const WS_PORT = qs.get('port') || location.port || '8765';
+const WS_URL  = `ws://${WS_HOST}:${WS_PORT}`;
+document.getElementById('wsurl').textContent = `${WS_HOST}:${WS_PORT}`;
+
+// ----- 3d math ------------------------------------------------------------
+// world: +X right, +Y up, camera looks down -Z.  p_cam = Rz(-roll)·Rx(-pitch)·Ry(-yaw)·p
+function rotX(t){const c=Math.cos(t),s=Math.sin(t);return [1,0,0, 0,c,-s, 0,s,c];}
+function rotY(t){const c=Math.cos(t),s=Math.sin(t);return [c,0,s, 0,1,0, -s,0,c];}
+function rotZ(t){const c=Math.cos(t),s=Math.sin(t);return [c,-s,0, s,c,0, 0,0,1];}
+function mul(a,b){
+  const o=new Array(9);
+  for(let r=0;r<3;r++)for(let c=0;c<3;c++)
+    o[r*3+c]=a[r*3]*b[c]+a[r*3+1]*b[3+c]+a[r*3+2]*b[6+c];
+  return o;
+}
+function apply(m,x,y,z){
+  return { x:m[0]*x+m[1]*y+m[2]*z, y:m[3]*x+m[4]*y+m[5]*z, z:m[6]*x+m[7]*y+m[8]*z };
+}
+
+// ----- scene (built once, in world space) --------------------------------
+const FLOOR_Y=-1.6, CEIL_Y=1.6, HALF_W=6, FAR_Z=-36, NEAR=0.12;
+const SEGS=[];
+function seg(x1,y1,z1,x2,y2,z2){ SEGS.push([x1,y1,z1,x2,y2,z2]); }
+function buildScene(){
+  // floor grid
+  for(let x=-HALF_W;x<=HALF_W;x+=1.5) seg(x,FLOOR_Y,4,x,FLOOR_Y,FAR_Z);
+  for(let z=4;z>=FAR_Z;z-=2)          seg(-HALF_W,FLOOR_Y,z,HALF_W,FLOOR_Y,z);
+  // ceiling grid (sparser)
+  for(let x=-HALF_W;x<=HALF_W;x+=3)   seg(x,CEIL_Y,4,x,CEIL_Y,FAR_Z);
+  for(let z=4;z>=FAR_Z;z-=4)          seg(-HALF_W,CEIL_Y,z,HALF_W,CEIL_Y,z);
+  // side walls
+  for(let z=4;z>=FAR_Z;z-=3){ seg(-HALF_W,FLOOR_Y,z,-HALF_W,CEIL_Y,z); seg(HALF_W,FLOOR_Y,z,HALF_W,CEIL_Y,z); }
+  seg(-HALF_W,FLOOR_Y,FAR_Z,HALF_W,FLOOR_Y,FAR_Z);
+  seg(-HALF_W,CEIL_Y,FAR_Z,HALF_W,CEIL_Y,FAR_Z);
+  // wireframe cubes for parallax
+  const cubes=[[-3.2,-1.6,-6,1.4],[3.1,-1.6,-11,1.1],[-3.6,-0.2,-18,1.8],[2.6,0.3,-26,1.5]];
+  const edges=[[0,1],[1,3],[3,2],[2,0],[4,5],[5,7],[7,6],[6,4],[0,4],[1,5],[2,6],[3,7]];
+  for(const [cx,by,cz,s] of cubes){
+    const h=s, tx=cx+s/2, ty=by+h, tz=cz+s/2;
+    const v=[[cx,by,cz],[tx,by,cz],[tx,by,tz],[cx,by,tz],
+             [cx,ty,cz],[tx,ty,cz],[tx,ty,tz],[cx,ty,tz]];
+    for(const [a,b] of edges) seg(v[a][0],v[a][1],v[a][2],v[b][0],v[b][1],v[b][2]);
+  }
+}
+buildScene();
+
+// ----- state --------------------------------------------------------------
+let target={yaw:0,pitch:0,roll:0};
+let shown ={yaw:0,pitch:0,roll:0};
+let msgs=0, msgTimes=[], rtt=null, lastRecv=0, connected=false;
+const cvs=document.getElementById('c'), ctx=cvs.getContext('2d');
+let W=0,H=0,DPR=1;
+
+function resize(){
+  DPR=Math.min(devicePixelRatio||1,2);
+  W=innerWidth; H=innerHeight;
+  cvs.width=W*DPR; cvs.height=H*DPR;
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+}
+addEventListener('resize',resize); resize();
+
+// ----- websocket ----------------------------------------------------------
+let ws=null, reconTimer=null;
+function setState(txt, cls){
+  document.getElementById('state').textContent=txt;
+  document.getElementById('dot').className='dot'+(cls?(' '+cls):'');
+  document.getElementById('offline').classList.toggle('show', !connected);
+}
+function connect(){
+  clearTimeout(reconTimer);
+  try{ ws=new WebSocket(WS_URL); }catch(e){ return retry(); }
+  ws.onopen =()=>{ connected=true; setState('connected','on'); };
+  ws.onclose=()=>{ connected=false; setState('disconnected','off'); retry(); };
+  ws.onerror=()=>{ try{ws.close();}catch(_){} };
+  ws.onmessage=(ev)=>{
+    let p; try{ p=JSON.parse(ev.data); }catch(e){ return; }
+    if(typeof p.source==='string') document.getElementById('src').textContent=p.source;
+    target.yaw   = (p.yaw   ||0) * (document.getElementById('iy').checked?-1:1);
+    target.pitch = (p.pitch ||0) * (document.getElementById('ip').checked?-1:1);
+    target.roll  = (p.roll  ||0) * (document.getElementById('ir').checked?-1:1);
+    if(typeof p.t==='number') rtt = (Date.now()/1000 - p.t)*1000;
+    msgs++; lastRecv=performance.now();
+    msgTimes.push(lastRecv); if(msgTimes.length>120) msgTimes.shift();
+  };
+}
+function retry(){ reconTimer=setTimeout(connect, 1200); }
+document.getElementById('reconnect').onclick=()=>{ try{ws.close();}catch(_){} connect(); };
+document.getElementById('reset').onclick=()=>{ target={yaw:0,pitch:0,roll:0}; shown={yaw:0,pitch:0,roll:0}; };
+connect();
+
+// ----- render -------------------------------------------------------------
+function clipSeg(a,b){
+  const ia=a.z<=-NEAR, ib=b.z<=-NEAR;
+  if(!ia&&!ib) return null;
+  if(ia&&ib) return [a,b];
+  const t=(-NEAR-a.z)/(b.z-a.z);
+  const m={x:a.x+(b.x-a.x)*t, y:a.y+(b.y-a.y)*t, z:-NEAR};
+  return ia?[a,m]:[m,b];
+}
+
+function draw(t){
+  requestAnimationFrame(draw);
+
+  // smooth toward target
+  const k=0.25;
+  for(const ax of ['yaw','pitch','roll']) shown[ax]+=(target[ax]-shown[ax])*k;
+
+  const yaw  = shown.yaw  *Math.PI/180;
+  const pitch= shown.pitch*Math.PI/180;
+  const roll = shown.roll *Math.PI/180;
+  const R = mul(rotZ(-roll), mul(rotX(-pitch), rotY(-yaw)));
+
+  const f = H*1.05, cx=W/2, cy=H/2;
+
+  ctx.fillStyle=getComputedStyle(document.body).getPropertyValue('--bg')||'#0b0f16';
+  ctx.fillRect(0,0,W,H);
+
+  // --- wireframe room
+  ctx.lineWidth=1;
+  for(const [x1,y1,z1,x2,y2,z2] of SEGS){
+    let a=apply(R,x1,y1,z1), b=apply(R,x2,y2,z2);
+    const cl=clipSeg(a,b); if(!cl) continue;
+    a=cl[0]; b=cl[1];
+    const depth=-(a.z+b.z)/2;
+    const alpha=Math.max(0.06, Math.min(0.75, 2.2/Math.max(depth,0.6)));
+    const sa=f/(-a.z), sb=f/(-b.z);
+    const ax=cx+a.x*sa, ay=cy-a.y*sa, bx=cx+b.x*sb, by=cy-b.y*sb;
+    ctx.strokeStyle=`rgba(88,166,255,${alpha.toFixed(3)})`;
+    ctx.beginPath(); ctx.moveTo(ax,ay); ctx.lineTo(bx,by); ctx.stroke();
+  }
+
+  // --- artificial horizon (screen space, unambiguous truth) ---
+  ctx.save();
+  ctx.translate(cx, cy - pitch*f);
+  ctx.rotate(roll);
+  const L=Math.max(W,H);
+  ctx.strokeStyle='rgba(63,185,80,.75)'; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.moveTo(-L,-0); ctx.lineTo(-24,0); ctx.moveTo(24,0); ctx.lineTo(L,0); ctx.stroke();
+  ctx.strokeStyle='rgba(63,185,80,.28)'; ctx.lineWidth=1;
+  for(let d=-30; d<=30; d+=10){                 // pitch ladder, 10 deg steps
+    if(d===0) continue;
+    const y=d*f;                                // 1 deg -> 1*f px  (approx)
+    const w=Math.abs(d)%30===0?46:26;
+    ctx.beginPath(); ctx.moveTo(-w,y); ctx.lineTo(-12,y); ctx.moveTo(12,y); ctx.lineTo(w,y); ctx.stroke();
+  }
+  ctx.restore();
+
+  // --- compass tape (yaw) ---
+  const cyaw=34, degPerPx=0.5;
+  ctx.strokeStyle='rgba(139,148,158,.5)'; ctx.lineWidth=1;
+  ctx.beginPath(); ctx.moveTo(0,cyaw); ctx.lineTo(W,cyaw); ctx.stroke();
+  const yawDeg=shown.yaw;
+  const base=Math.round((yawDeg-100*degPerPx)/10)*10;
+  ctx.fillStyle='rgba(139,148,158,.9)'; ctx.font='10px ui-monospace,monospace'; ctx.textAlign='center';
+  for(let d=base; d<=base+200*degPerPx; d+=10){
+    const px=cx+(d-yawDeg)/degPerPx;
+    if(px<0||px>W) continue;
+    const major=(d%90===0)||(d%30===0);
+    ctx.beginPath(); ctx.moveTo(px,cyaw); ctx.lineTo(px,cyaw+(major?7:3)); ctx.stroke();
+    if(d%30===0){
+      const lbl=((d%360)+360)%360;
+      ctx.fillText(String(lbl), px, cyaw-3);
+    }
+  }
+
+  // --- reticle ---
+  ctx.strokeStyle='rgba(230,237,243,.85)'; ctx.lineWidth=1.5;
+  ctx.beginPath(); ctx.arc(cx,cy,4,0,Math.PI*2); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(cx-12,cy); ctx.lineTo(cx-6,cy); ctx.moveTo(cx+6,cy); ctx.lineTo(cx+12,cy);
+  ctx.moveTo(cx,cy-12); ctx.lineTo(cx,cy-6); ctx.moveTo(cx,cy+6); ctx.lineTo(cx,cy+12); ctx.stroke();
+
+  drawHud();
+}
+
+function drawHud(){
+  document.getElementById('msgs').textContent=msgs;
+  const rate = msgTimes.length>1
+    ? (msgTimes.length-1)/((msgTimes[msgTimes.length-1]-msgTimes[0])/1000) : 0;
+  document.getElementById('hz').textContent=rate.toFixed(1)+' Hz';
+  document.getElementById('lat').textContent = (rtt==null||!connected) ? '—' : rtt.toFixed(0)+' ms';
+  document.getElementById('py').textContent=shown.yaw.toFixed(1)+'°';
+  document.getElementById('pp').textContent=shown.pitch.toFixed(1)+'°';
+  document.getElementById('pr').textContent=shown.roll.toFixed(1)+'°';
+  if(connected && performance.now()-lastRecv>3000) setState('connected (idle)','');
+}
+
+requestAnimationFrame(draw);
+
+// expose a little state for automated checks
+window.__xreal = {
+  snapshot: () => ({ connected, msgs, shown:{...shown}, target:{...target} }),
+};
+</script>
+</body>
+</html>

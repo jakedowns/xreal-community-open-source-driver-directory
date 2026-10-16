@@ -1,0 +1,25 @@
+# XREAL Air (3318:0424) — hidraw + usb access for userspace consumers.
+#
+# Who needs this:
+#   * Chrome/Chromium WebHID  (opens /dev/hidraw* read-write to send reports)
+#   * Monado's xreal_air driver (reads the IMU stream from hidraw)
+#   * any Rust/hidapi IMU reader you build
+#
+# Why GROUP=plugdev instead of TAG+="uaccess":
+#   The local user (uid 1000) is ALREADY in the plugdev group (gid 46), so this
+#   works immediately after a replug with no logout/re-login. uaccess only grants
+#   access to the active *seat* session and silently does nothing over SSH or on a
+#   bare console — which is common inside a VM.
+#
+# Install:
+#   sudo cp 70-xreal-air.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules
+#   sudo udevadm trigger --subsystem-match=hidraw
+#   # then unplug and replug the glasses
+#
+# Verify:
+#   ls -l /dev/hidraw*            # expect crw-rw---- root plugdev
+#   test -r /dev/hidraw3 && test -w /dev/hidraw3 && echo "rw OK"
+
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="3318", MODE="0660", GROUP="plugdev"
+SUBSYSTEM=="usb",    ATTRS{idVendor}=="3318", MODE="0660", GROUP="plugdev"

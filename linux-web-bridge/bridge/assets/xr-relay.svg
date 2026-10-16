@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <rect width="256" height="256" rx="54" fill="#0d1117"/>
+  <rect x="2" y="2" width="252" height="252" rx="52" fill="none" stroke="#21304a" stroke-width="3"/>
+
+  <!-- wireless/signal arcs -->
+  <g fill="none" stroke="#39d2c0" stroke-width="7" stroke-linecap="round" opacity="0.95">
+    <path d="M110 74a26 26 0 0 1 36 0"/>
+    <path d="M96 58a46 46 0 0 1 64 0"/>
+  </g>
+
+  <!-- arms -->
+  <g stroke="#1f6feb" stroke-width="11" stroke-linecap="round">
+    <line x1="34" y1="132" x2="8" y2="120"/>
+    <line x1="222" y1="132" x2="248" y2="120"/>
+  </g>
+
+  <!-- lenses -->
+  <g fill="#0b1b2e" stroke="#58a6ff" stroke-width="9">
+    <rect x="30" y="104" width="86" height="62" rx="20"/>
+    <rect x="140" y="104" width="86" height="62" rx="20"/>
+  </g>
+
+  <!-- hint of a scene inside the lenses -->
+  <g fill="#58a6ff" opacity="0.35">
+    <rect x="44" y="120" width="58" height="7" rx="3.5"/>
+    <rect x="44" y="134" width="38" height="7" rx="3.5"/>
+    <rect x="154" y="120" width="58" height="7" rx="3.5"/>
+    <rect x="154" y="134" width="38" height="7" rx="3.5"/>
+  </g>
+
+  <!-- bridge -->
+  <rect x="114" y="126" width="28" height="13" rx="6.5" fill="#58a6ff"/>
+</svg>

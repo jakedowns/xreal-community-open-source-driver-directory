@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+#
+# Launch XR Relay (windowed). Kept in the repo so the .desktop entry can be a
+# symlink to it; readlink -f resolves the symlink back to this directory.
+#
+set -euo pipefail
+DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+exec python3 "$DIR/xr_relay_gui.py" "$@"
